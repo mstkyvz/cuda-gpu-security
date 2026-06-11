@@ -10,22 +10,31 @@ Modern ML inference servers allocate and free GPU tensors thousands of times per
 
 | Scenario | Method | Result |
 |----------|--------|--------|
-| Same-process, standard alloc | `cudaMalloc` → `cudaFree` → `cudaMalloc` | ⚠️ 0.4% partial residue |
-| Same-process, pool alloc | `cudaMallocAsync` → `cudaFreeAsync` → `cudaMallocAsync` | 🔴 **100% FULL LEAK** |
-| Same-process, PyTorch tensors | `torch.empty` after `del tensor` | 🔴 **100% FULL LEAK** |
-| ML inference KV-cache | Two requests sharing pool | 🔴 **100% FULL LEAK** |
+| Same-process, standard alloc | `cudaMalloc` → `cudaFree` → `cudaMalloc` | ✅ SAFE (driver zeroes, 0/1024) |
+| Same-process, pool (no sync) | `cudaMallocAsync` back-to-back on same stream | 🔴 **100% FULL LEAK** |
+| Same-process, pool (with sync) | `cudaMallocAsync` + `cudaStreamSynchronize` + realloc | ✅ SAFE (pool zeroes after sync) |
+| Same-process, PyTorch (with sync) | `torch.empty` + `torch.cuda.synchronize()` + `torch.empty` | 🔴 **100% FULL LEAK** |
+| ML inference KV-cache | Two sequential requests, same PyTorch process | 🔴 **100% FULL LEAK** |
+| Two models, same process | Model A unload → Model B allocates hidden buffers | 🔴 **100% FULL LEAK** |
+| Persistent scanner | 10 rounds: victim fill → attacker `torch.empty` | 🔴 **100% every round** |
 | Cross-process | Process A exits → Process B allocates | ✅ SAFE (driver zeroes) |
+| Cross-stream (cudaMallocAsync) | Stream A free → Stream B alloc (with sync) | ✅ SAFE (pool zeroes) |
 
 ## Key Insight
 
-`cudaMalloc` zero-initializes GPU memory (secure). But `cudaMallocAsync` and PyTorch's `CUDACachingAllocator` **do not** — they return previously used memory directly from a pool for performance. This means `torch.empty()` is not actually empty.
+`cudaMalloc` and the raw `cudaMallocAsync` pool (with stream sync) both zero-initialize GPU memory. **PyTorch's `CUDACachingAllocator` does not** — it maintains its own free list in Python/C++ space and bypasses driver-level zeroing entirely. This means `torch.empty()` is genuinely uninitialized and always contains whatever the previous occupant left there.
+
+Critical nuance: `torch.cuda.synchronize()` (which every inference server calls between requests) **does not prevent the leak** — PyTorch's allocator ignores it.
 
 ## Repository Structure
 
 ```
-01_uninitialized_memory/    Experiment 1: cudaMalloc vs cudaMallocAsync
+01_uninitialized_memory/    Experiments 1A/1B: cudaMalloc vs cudaMallocAsync
 02_cross_process/           Experiment 2: Cross-process isolation test  
 03_ml_inference/            Experiment 3: KV-cache leak in shared inference
+04_multi_stream/            Experiment 4: CUDA stream pool sharing
+05_two_models/              Experiment 5: Cross-model data leak
+06_persistent_scan/         Experiment 6: Persistent GPU pool scanner
 ```
 
 ## Environment
@@ -63,14 +72,16 @@ Write a byte pattern to a GPU buffer, free it with `cudaFree`, allocate a new bu
 
 **Result:**
 ```
-Old ptr: 0x7f62c4c00000
-New ptr: 0x7f62c4c00000   ← same address returned
+Old ptr: 0x7ff438c00000
+New ptr: 0x7ff438c00000   ← same address returned
 
-Bytes matching secret pattern: 4 / 1024 (0.4%)
-[~] PARTIAL LEAK: 4 bytes of previous data still readable.
+Non-zero words:          0 / 1024
+Matching secret pattern: 0 / 1024 (0.00%)
+
+[SAFE] Driver zeroed memory on cudaMalloc.
 ```
 
-**Analysis:** The NVIDIA driver scrubs most of the memory on allocation, but 4 bytes were not zeroed. This may be coincidental (the pattern happens to match) or a genuine residue. Either way, `cudaMalloc` is largely safe due to driver-level scrubbing.
+**Analysis:** The NVIDIA driver zero-initializes memory on every `cudaMalloc` call. Standard allocations are safe. Note: an earlier version of this test used a byte pattern that wraps to zero, producing 4 false-positive matches. The final version uses `0xDEAD0000 + i` (never zero) to eliminate this class of error.
 
 ### Test 1B: `cudaMallocAsync` Pool Allocator (pool_memory_leak.cu)
 
@@ -177,6 +188,112 @@ This is **documented behavior**, not a driver bug. NVIDIA and PyTorch both state
 
 ---
 
+## Experiment 4 — Multi-Stream Pool Behavior
+
+**Directory:** `04_multi_stream/`
+
+### Background
+
+CUDA stream-ordered pools (`cudaMallocAsync`) are per-device, not per-stream. But the pool's
+zeroing behavior depends on whether the CPU synchronized between free and realloc.
+
+### Results
+
+```
+[TEST 1] Writer and reader on the SAME CUDA stream:
+    Writer ptr : 0x302000000
+    Reader ptr : 0x302000000  (same: YES)
+    Non-zero   : 0 / 4096
+    --> SAFE (pool zeroed after stream sync)
+
+[TEST 2] Writer on Stream A, reader on Stream B (different streams):
+    Writer ptr : 0x302000000
+    Reader ptr : 0x302000000  (same: YES)
+    Non-zero   : 0 / 4096
+    --> SAFE (pool zeroed cross-stream)
+```
+
+**Analysis:** When `cudaStreamSynchronize()` is called between `cudaFreeAsync` and `cudaMallocAsync`,
+the CUDA driver zeroes the block before returning it — in both same-stream and cross-stream cases.
+This is a safety mechanism in the raw CUDA pool allocator.
+
+**Critical nuance:** PyTorch's `CUDACachingAllocator` does NOT use `cudaMallocAsync`. It maintains
+its own free list in C++ space, bypassing the driver's zeroing. This is why PyTorch shows 100% leak
+even after `torch.cuda.synchronize()`, while raw `cudaMallocAsync` tests show safe results when synced.
+
+---
+
+## Experiment 5 — Two Models, Same Process
+
+**Directory:** `05_two_models/`
+
+### Background
+
+In a multi-model serving system (e.g., running multiple LLM adapters), models are loaded and unloaded
+sequentially. If Model A's tensors are freed to the PyTorch pool and Model B allocates from the same pool,
+Model B's buffers contain Model A's activation data.
+
+### Result
+
+```
+[1] Loading Model A (hidden=8192, batch=256)...
+    Model A hidden ptr   : 0x7f16dce00000  (size 4096 KB)
+    Model A hidden[0,:4] : [1.2861, 0.8237, -1.3125, 1.0205]
+
+[2] Unloading Model A — returned to pool, NOT zeroed
+
+[3] Loading Model B...
+    Model B hidden ptr : 0x7f16dce00000   ← same address!
+    Same as Model A    : True
+
+[4] Model B 'empty' hidden buffer:
+    Non-zero elements : 2,096,896 / 2,097,152 (100.0%)
+    Buffer[0,:4]      : [1.2861, 0.8237, -1.3125, 1.0205]   ← Model A's data!
+    Value match [0,:4]: [True, True, True, True]
+
+[5] Mitigation torch.zeros: 0 / 2,097,152 ✓
+```
+
+**Analysis:** Model B's first hidden-layer buffer was allocated with `torch.empty` and returned the
+exact same pointer as Model A's hidden layer. All 2,096,896 elements are non-zero and bit-identical
+to Model A's hidden activations. In a LoRA adapter serving setup, this means base model residual
+buffers can contain the previous adapter's private fine-tuned activations.
+
+---
+
+## Experiment 6 — Persistent Pool Scanner
+
+**Directory:** `06_persistent_scan/`
+
+### Background
+
+Simulates a persistent attacker on a shared GPU server that repeatedly allocates `torch.empty`
+tensors after each request to scan for residual data. Runs 10 rounds with different victim patterns.
+
+### Result
+
+```
+Round   Secret      Ptr-reuse   Leaked/Total      Match%
+1       2.71828     YES         524,286/524,288    100.0%
+         Leaked  [0:4]: ['2.99011', '2.71828', '2.71828', '2.71828']
+         Expected     : 2.71828 (all elements should be 2.71828)
+         Marker[0]    : 2.99011  (expected 2.99011)   ← custom marker preserved!
+         Marker[-1]   : 26.91097 (expected 26.91097)  ← end marker preserved!
+2       3.14159     YES         524,286/524,288    100.0%
+3       1.41421     YES         524,286/524,288    100.0%
+[... 7 more rounds, all 100% ...]
+
+Total leaked: 5,242,860/5,242,880 (100.0%)
+torch.cuda.synchronize() between rounds: YES — does NOT prevent leak
+```
+
+**Analysis:** Across all 10 rounds, the attacker recovered 100% of the victim's tensor data. The
+custom marker values (`secret * 1.1` at index 0, `secret * 9.9` at index -1) were recovered exactly,
+confirming that full tensor contents — not just statistical residue — are accessible. `synchronize()`
+between rounds has no effect because PyTorch's allocator never zeroes memory.
+
+---
+
 ## Reproducing
 
 ### Requirements
@@ -187,19 +304,29 @@ This is **documented behavior**, not a driver bug. NVIDIA and PyTorch both state
 ### Run all experiments
 
 ```bash
-# Experiment 1A
+# Experiment 1A — cudaMalloc (safe)
 nvcc -O2 -o uninit_memory_leak 01_uninitialized_memory/uninit_memory_leak.cu
 ./uninit_memory_leak
 
-# Experiment 1B
+# Experiment 1B — cudaMallocAsync pool (100% leak)
 nvcc -O2 -o pool_memory_leak 01_uninitialized_memory/pool_memory_leak.cu
 ./pool_memory_leak
 
-# Experiment 2
+# Experiment 2 — cross-process isolation (safe)
 nvcc -O2 -o writer 02_cross_process/writer.cu
 nvcc -O2 -o reader 02_cross_process/reader.cu
 ./writer && ./reader
 
-# Experiment 3
+# Experiment 3 — KV-cache leak (100% leak)
 python3 03_ml_inference/kv_cache_leak.py
+
+# Experiment 4 — multi-stream behavior
+nvcc -O2 -o stream_leak 04_multi_stream/stream_leak.cu
+./stream_leak
+
+# Experiment 5 — two models, same process (100% leak)
+python3 05_two_models/two_model_leak.py
+
+# Experiment 6 — persistent pool scanner (100% every round)
+python3 06_persistent_scan/persistent_scan.py
 ```

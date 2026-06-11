@@ -79,28 +79,12 @@ def run_poc():
 
     del leaked
 
-    # Step 3: Show same leak with explicit pool (torch.cuda.caching_allocator_alloc)
-    print("\n--- Direct pool allocation (lower level) ---")
-    import ctypes
-    NBYTES = N * 4
-    # Allocate and write secret directly via caching allocator
-    ptr1 = torch.cuda.caching_allocator_alloc(NBYTES)
-    # Write pattern via a tensor wrapping this pointer
-    t1 = torch.frombuffer(
-        (ctypes.c_byte * NBYTES).from_address(0),  # placeholder
-        dtype=torch.float32
-    ) if False else None
-
-    # Simpler: just show the CUDA C result is definitive
-    print("    See pool_memory_leak.cu for 100% confirmed leak via cudaMallocAsync.")
-    print("    PyTorch CUDACachingAllocator sits on top of the same pool.")
-
-    # Step 4: Mitigation
-    print("\n--- Mitigation ---")
+    # Step 3: Mitigation
+    print("\n--- Mitigation (torch.zeros) ---")
     safe = torch.zeros(N, dtype=torch.float32, device=device)
-    safe_cpu = safe.cpu()
-    safe_matches = (safe_cpu - expected).abs() < 1e-3
-    print(f"    torch.zeros match: {safe_matches.sum().item()} / {N} (safe: {safe_matches.sum().item() == 0})")
+    safe_nonzero = (safe.cpu().abs() > 1e-9).sum().item()
+    print(f"    torch.zeros non-zero elements: {safe_nonzero} / {N} "
+          f"({'SAFE' if safe_nonzero == 0 else 'NOT SAFE'})")
     del safe
 
 
