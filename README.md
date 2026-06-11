@@ -43,6 +43,7 @@ Modern ML inference servers allocate and free GPU tensors thousands of times per
 | 28 | Tensor Core wmma residue | wmma fragment (regs), __shared__ staging, local mem spill | 🔴 **Reg: SAFE; __shared__ staging: LEAK 12-20% blocks; local mem spill: LEAK 97-100%** |
 | 29 | CUDA IPC cross-process isolation | cudaIpcGetMemHandle: direct share, pool residue, lazy-open | 🔴 **A: LEAK 100%; B: SAFE; C: LEAK 100% (live mapping post-export)** |
 | 30 | cuDNN workspace residue | Conv workspace: pool reuse, GEMM state residue | 🔴 **Pool residue LEAK 5/5 (same-stream no-sync); cuDNN GEMM state remains in workspace after op** |
+| 31 | SM occupancy timing | SM co-scheduling detection via compute throughput & HBM latency | 🟡 **SM slowdown DETECTABLE 3/5 passes (~1.87x); HBM bandwidth contention SAFE 5/5** |
 
 ## Key Insights
 
@@ -80,6 +81,8 @@ Modern ML inference servers allocate and free GPU tensors thousands of times per
 
 - **GPU L2 cache timing side-channel works**: H100 L2 (50 MB) is shared across all SMs with no per-process or per-stream partition. Attacker uses differential Prime+Probe: flush L2 → baseline probe → flush L2 → victim access → attack probe → largest latency drop = victim slot. L2 hit: ~674 cycles, HBM miss: ~840–1280 cycles (1.25×–1.90× ratio). Avg 92% secret inference across 5 passes (13–16/16 per run, random baseline 6.25%). Cross-stream L2 NOT isolated. MIG instances are immune (separate L2 per partition); standard GPU isolation is not.
 - **CUDA Graphs do NOT zero pool allocations**: `cudaMallocAsync` inside a graph capture reuses the same pool block from the warmup run. That block holds the warmup-phase activation data when the graph replays for a new request. PyTorch `torch.cuda.CUDAGraph` is directly affected. Graph destroy correctly zeroes the pool block (SAFE). `__shared__` residue from graph kernels follows the same behavior as standalone kernels (Exp 23).
+- **SM occupancy timing side-channel**: An attacker compute kernel can detect victim kernel presence on the same GPU via SM co-scheduling: launching 2112 CTAs (16 per SM) while victim runs identical load produces ~1.87x wall-clock slowdown in 3/5 measurement windows (60% per-window detection probability). Repeating 5 windows yields 99%+ victim-presence confidence. HBM bandwidth contention is NOT detectable — H100 HBM3 (3.35 TB/s) absorbs simultaneous 64MB sweeps by both attacker and victim without measurable latency increase.
+
 - **CUDA MPS __shared__ NOT isolated**: Under MPS, all client processes share the same GPU context. Pool (cudaMallocAsync) is zeroed on cross-client allocation (SAFE). But hardware SM SRAM (__shared__) has no per-client isolation — attacker process reads 100% of victim process's __shared__ data at ≤100ms timing (realistic back-to-back inference requests). Both clients got identical virtual addresses (0x420000000) confirming shared context.
 
 ## Repository Structure
@@ -115,6 +118,7 @@ Modern ML inference servers allocate and free GPU tensors thousands of times per
 28_tensor_core/             Exp 28:    Tensor Core wmma fragment/shared/local-mem residue
 29_cuda_ipc/                Exp 29:    CUDA IPC cross-process GPU memory isolation
 30_cudnn_workspace/         Exp 30:    cuDNN convolution workspace residue
+31_sm_occupancy/           Exp 31:    SM occupancy timing side-channel
 ```
 
 ## Environment

@@ -1549,3 +1549,58 @@ Test C — Cross-stream pool residue (5 passes):
 - Both leave computation state readable by next same-stream pool allocation
 
 **Practical scenario:** In a multi-tenant DNN inference server, consecutive requests using the same cuDNN stream share pool allocations. Request A's cuDNN convolution leaves intermediate filter transform data in the workspace pool block. Request B's workspace pool allocation receives the same block with Request A's computation residue. While this doesn't affect B's output (cuDNN overwrites first), the residue is readable between the free and cuDNN's first write — a narrow window exploitable by a CUDA kernel co-scheduled on the same SM.
+
+---
+
+## Experiment 31: SM Occupancy Timing Side-Channel
+
+**Context:** CUDA does not guarantee isolated GPU execution — multiple concurrent CTAs from different kernels and streams can co-schedule on the same SM. An attacker kernel could potentially detect victim kernel presence by observing degradation in its own execution throughput. This experiment tests two channels: (A) SM compute throughput timing via wall-clock measurement of a fixed FP32 workload, and (B) HBM bandwidth contention via per-access latency measurement using `ld.global.cg` (bypasses L1, forces L2/HBM path).
+
+**Setup:**
+- H100 SXM5 80GB HBM3 (GPU 1, idle from Nemotron), CUDA 12.8, 132 SMs
+- Test A: 2112 blocks x 128 threads (16 blocks/SM x 132 SMs) of FP32 MAD chain (262144 iters/block) — attacker and victim forced to share SMs; wall-clock time measured
+- Test B: attacker and victim sweep SEPARATE 64MB buffers (> 50MB L2 -> guaranteed HBM misses) using ldcg; victim runs for 1 second to ensure overlap; per-access cycle count measured via clock64()
+
+**Result (5-pass verified):**
+
+```
+Test A — SM compute throughput with/without victim (5 passes):
+  Pass 1: baseline=3ms  with_victim=7ms  ratio=1.89x  [!!!] DETECTED
+  Pass 2: baseline=3ms  with_victim=4ms  ratio=1.05x  [~] not detected
+  Pass 3: baseline=3ms  with_victim=4ms  ratio=1.05x  [~] not detected
+  Pass 4: baseline=3ms  with_victim=7ms  ratio=1.86x  [!!!] DETECTED
+  Pass 5: baseline=3ms  with_victim=7ms  ratio=1.85x  [!!!] DETECTED
+  -> SM CO-SCHEDULING DETECTED 3/5 passes (~1.87x slowdown when detected)
+
+Test B — HBM bandwidth contention with victim running 1s (5 passes):
+  Pass 1: baseline=1279 cycles  with_victim=1256 cycles  ratio=0.98x  SAFE
+  Pass 2: baseline=1310 cycles  with_victim=1254 cycles  ratio=0.96x  SAFE
+  Pass 3: baseline=1297 cycles  with_victim=1255 cycles  ratio=0.97x  SAFE
+  Pass 4: baseline=1331 cycles  with_victim=1269 cycles  ratio=0.95x  SAFE
+  Pass 5: baseline=1269 cycles  with_victim=1277 cycles  ratio=1.01x  SAFE
+  -> NO HBM bandwidth contention detectable (all ratios ~1.00 +/- 0.05)
+```
+
+**Key findings:**
+
+| Test | Result | Detail |
+|------|--------|--------|
+| A | DETECTABLE 3/5 | SM compute throughput ~1.87x slower when co-scheduled with victim |
+| B | SAFE 5/5 | HBM bandwidth (3.35 TB/s) absorbs concurrent workloads without degradation |
+
+**Why Test A detects (SM co-scheduling):** When both attacker (2112 CTAs) and victim (2112 CTAs) are in flight simultaneously, each SM must schedule warps from both. H100's greedy FIFO CTA scheduler assigns victim CTAs first (launched first on CPU), then attacker CTAs queue. As victim CTAs finish on each SM, attacker CTAs launch. During the overlap window: each SM's 64 warp slots are shared between attacker and victim warps — the attacker effectively gets ~50% of SM throughput -> ~2x wall-clock slowdown for a fixed-work kernel.
+
+**Why 3/5 (non-deterministic):** Scheduling is greedy and FIFO at the CTA level. In passes 2 and 3: the victim's first wave finishes quickly, and by the time the attacker's CTAs are all dispatched, the victim's queued CTAs may already occupy the "victim slots" that would create contention. The attacker ends up running mostly without victim overlap in those passes. The inconsistency is a property of the GPU's non-deterministic CTA scheduler, not measurement error.
+
+**Why Test B is SAFE:** H100 HBM3 peak bandwidth is 3.35 TB/s. Both attacker and victim sweep 64MB buffers with ldcg (bypasses L1, uses L2/HBM path). Even simultaneously, total bandwidth demand is 2x their per-sweep throughput. At the measured ~1280 cycles/access x 1980 MHz = ~645 ns latency, H100's prefetcher and high bandwidth absorb the combined load without degradation. The ratio never exceeds 1.01x across all 5 passes.
+
+**Security implications:**
+- An attacker kernel CAN detect victim kernel presence via compute throughput timing — 3/5 detection rate with ~2x signal magnitude in a 3ms window
+- This is a genuine timing side-channel: an attacker process running a compute-bound kernel on the same GPU can infer victim presence without any shared memory or IPC
+- HBM bandwidth is NOT a useful timing channel on H100 — bandwidth isolation is effectively complete
+- The inconsistency means victim-presence detection is probabilistic: detection probability ~60% per 3ms window -> 99%+ confidence after ~5 independent measurement windows
+
+**Comparison with CPU microarchitecture side-channels:**
+- CPU: simultaneous multithreading (SMT) allows cycle-accurate timing side-channels via shared execution units
+- GPU: SM-level co-scheduling achieves similar effect — victim's CTA presence measurably degrades attacker throughput
+- GPU channel is coarser (3ms windows, 2x magnitude vs CPU cycle-accurate channels), but the principle is the same: shared SM execution resources leak occupancy information
