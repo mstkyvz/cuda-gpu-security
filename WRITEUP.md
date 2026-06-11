@@ -1493,3 +1493,59 @@ Test C — Lazy-open (live mapping):
 - Test A: CUDA IPC provides no confidentiality — if an attacker process obtains an IPC handle (via handle injection, compromised MPS coordinator, or driver exploit), it reads the victim's GPU buffer completely.
 - Test C: Write-after-export visibility enables covert channels between cooperating malicious processes on shared GPU infrastructure.
 - Test B (SAFE): Pool residue cross-process via IPC is blocked at the `cudaMalloc` allocation boundary — a positive isolation finding.
+---
+
+## Experiment 30: cuDNN Workspace Residue
+
+**Context:** cuDNN operations (convolutions, attention, normalization) require a user-allocated workspace buffer passed to each operation. The workspace serves as a scratch buffer for intermediate computation (e.g., precomputed filter transforms in GEMM-based algorithms). This parallels the cuBLAS workspace pattern (Exp 24). Questions: (A) does cuDNN leave intermediate computation state in the workspace? (B) does same-stream pool reuse deliver prior user's SECRET to cuDNN workspace? (C) does cross-stream pool reuse deliver SECRET?
+
+**Setup:**
+- cuDNN v9, algorithm `CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM` (requires workspace)
+- Conv: N=4, C_in=64, H×W=28×28 → C_out=128, kernel=3×3, workspace=2.4 MB (620548 floats)
+- GPU 1 (idle), H100 CUDA 12.8
+
+**Result (5-pass verified):**
+
+```
+Test A — Workspace content before and after cuDNN forward conv:
+  Pre-fill workspace with SECRET=3.14159 → run conv → read workspace
+  After conv: SECRET=4/620548  nz=620548/620548 (ALL non-zero)
+  cuDNN completely overwrites workspace with GEMM intermediate state.
+  The workspace after operation contains cuDNN's computation residue (not SECRET).
+  → Attack direction: victim runs cuDNN, workspace freed to pool, attacker re-allocates
+    (same stream, no sync) and reads victim's GEMM computation state (nz=620548/620548).
+
+Test B — Same-stream NO-SYNC pool residue in cuDNN workspace (5 passes):
+  Alloc pool block, fill SECRET, free (no sync), re-alloc → pass to cuDNN as workspace
+  Before conv: SECRET=620548/620548 (100% — same-stream pool reuse confirmed)
+  After conv:  SECRET=4/620548 (cuDNN overwrites with its own computation)
+  → [!!!] LEAK 5/5 — cuDNN receives workspace containing prior user's SECRET
+  → cuDNN is write-first (precomputes GEMM transforms before reading),
+    so initial SECRET does not influence computation output.
+    But: SECRET WAS in the workspace buffer passed to cuDNN's operation kernel.
+
+Test C — Cross-stream pool residue (5 passes):
+  All 5 passes: SECRET=0/620548
+  → SAFE — cross-stream allocation is zeroed
+```
+
+**Key findings:**
+
+| Test | Result | Detail |
+|------|--------|--------|
+| A | RESIDUE IN WORKSPACE | cuDNN GEMM intermediate state (620548 non-zero values) persists after op |
+| B | LEAK 5/5 (100%) | Same-stream no-sync: prior SECRET delivered to cuDNN workspace |
+| C | SAFE 5/5 | Cross-stream zeroed |
+
+**Why Test B leaks (pool residue):** Same-stream no-sync pool reuse (proven in Exps 1-22) delivers the previous allocation's data to the next caller. cuDNN's workspace is passed as a raw device pointer — cuDNN makes no guarantee that it zeroes the workspace before use. The algorithm `IMPLICIT_PRECOMP_GEMM` is write-before-read (writes precomputed filter transforms first), so the initial SECRET is overwritten immediately. However, a different cuDNN algorithm that reads workspace before writing would be influenced by the initial SECRET.
+
+**Why Test A matters (reverse direction):** After cuDNN finishes, its workspace contains intermediate GEMM state (partial matrix products, precomputed filter transforms). If this workspace is freed to the pool and re-allocated by an attacker kernel (same stream, no sync), the attacker reads partial cuDNN computation state — which may reveal information about filter weights or intermediate activation patterns.
+
+**Comparison with Exp 24 (cuBLAS workspace):**
+- Both cuBLAS and cuDNN workspaces leak via same-stream no-sync pool reuse
+- cuBLAS: workspace contains partial GEMM intermediate results after operation
+- cuDNN: workspace contains GEMM transform precomputation after operation
+- Both are write-first scratch buffers; initial SECRET content does not influence computation
+- Both leave computation state readable by next same-stream pool allocation
+
+**Practical scenario:** In a multi-tenant DNN inference server, consecutive requests using the same cuDNN stream share pool allocations. Request A's cuDNN convolution leaves intermediate filter transform data in the workspace pool block. Request B's workspace pool allocation receives the same block with Request A's computation residue. While this doesn't affect B's output (cuDNN overwrites first), the residue is readable between the free and cuDNN's first write — a narrow window exploitable by a CUDA kernel co-scheduled on the same SM.
