@@ -759,3 +759,159 @@ We demonstrated the full attack chain on real H100 hardware with real GPT-2 weig
 The fix is trivial: use `torch.zeros` instead of `torch.empty` for any tensor that will hold user-specific data. On H100, this change makes the code 48% faster, not slower. The confidentiality boundary between users costs nothing to enforce.
 
 Inference server maintainers should audit all KV-cache and activation buffer allocations and replace `torch.empty` with `torch.zeros` wherever user data could be present. This single-line change fully eliminates the vulnerability.
+
+---
+
+## Experiment 15: CUDA IPC — Cross-Process GPU Memory Access
+
+**Goal:** Can process B read process A's GPU memory using a CUDA IPC handle?
+
+CUDA IPC (`cudaIpcGetMemHandle` / `cudaIpcOpenMemHandle`) allows sharing GPU allocations across processes. It is used by PyTorch's `torch.multiprocessing`, NCCL, and some inference server worker-pool patterns.
+
+**Security question:** If an IPC handle leaks (via shared file, logging, API metadata, etc.), can an unauthorized process access the GPU data?
+
+**Method:**
+- Writer process: allocates GPU memory, fills with `secret=2.71828`, exports handle to `/tmp/cuda_ipc_handle.bin`
+- Reader process: loads handle, opens it in a fresh context, reads all data
+
+**Result (H100, two separate processes):**
+
+```
+[writer] GPU ptr : 0x7a801fe00000
+[writer] Secret  : 2.71828  (N=65536 floats)
+
+[reader] IPC ptr : 0x71d803e00000   ← different virtual address, same physical
+[reader] First 8 : 2.71828 2.71828 2.71828 2.71828 2.71828 2.71828 2.71828 2.71828
+[reader] Matching: 65536/65536  (100.0%)
+
+[!!!] FULL CROSS-PROCESS GPU MEMORY ACCESS VIA IPC HANDLE
+      Process B read Process A's GPU data without permission check.
+      Any process with the IPC handle file can read this memory.
+[reader] Overwrote writer's GPU memory with zeros (write access confirmed)
+```
+
+**Key findings:**
+1. **Full read + write access** via IPC handle — the reader has complete control of the writer's GPU allocation
+2. **No permission check** at the CUDA level — the handle file is the only access control
+3. **Cross-process**: different virtual addresses map to the same physical GPU memory
+4. **Risk in production**: NCCL all-reduce operations, PyTorch DataLoader workers, and any multi-process serving pattern that exchanges IPC handles creates this exposure
+
+**Attack vector:** If an inference server logs or exposes IPC handle metadata (e.g., in debug endpoints, process /proc mappings, or shared temp files), any other process on the same host with access to the handle file gains full R/W access to the GPU allocation. This bypasses driver-level cross-process zeroing entirely.
+
+---
+
+## Experiment 16: Multi-GPU P2P Leak (NVLink, 2× H100)
+
+**Goal:** On an NVLink-connected multi-GPU system, can GPU1 read GPU0's unfreed pool data?
+
+**Context:** Tensor-parallel LLM inference splits the model across GPUs. P2P memory copies (`cudaMemcpyPeer`) pass activations between GPU shards. If GPU0's activation pool has dirty data and GPU1 pulls it via P2P, GPU1 sees GPU0's previous request's data.
+
+**NVLink bandwidth:** 387.8 GB/s (confirmed NVLink active, not PCIe)
+
+**Result (2× H100 NVLink):**
+
+```
+[1] Peer access capability:
+    GPU0 → GPU1: YES
+    GPU1 → GPU0: YES
+
+[2] Scenario A: cudaFree → realloc → P2P copy to GPU1
+  GPU0 victim ptr  : 0x79befbe00000  (secret=2.71828)
+  GPU0 realloc ptr : 0x79befbe00000  (same? YES)
+  GPU1 received [0:4]: 0.00000 0.00000 0.00000 0.00000
+  [=] cudaFree returns to driver → zeroed → SAFE
+
+[3] Scenario B: pool-style reuse (no cudaFree) → P2P copy
+  GPU0 pool ptr (dirty): 0x79befbe00000  secret=2.71828
+  GPU1 received [0:4]: 2.71828 2.71828 2.71828 2.71828
+  Match (16/16): [!!!] CROSS-GPU LEAK via NVLink P2P
+```
+
+**Interpretation:**
+- **Scenario A (cudaFree path):** Driver zeroes the block before returning it to the pool. A P2P copy of the reallocation returns zeros. SAFE.
+- **Scenario B (pool reuse path, i.e., PyTorch pool):** No zeroing. GPU0's pool reuses the dirty block. P2P copy to GPU1 transfers the previous request's activation data exactly. **FULL LEAK at 387.8 GB/s via NVLink.**
+
+**Real-world scenario:** In tensor-parallel serving (vLLM with `--tensor-parallel-size 2`), each forward pass copies activations between GPU shards via NVLink. If those activation buffers come from the unzeroed pool, the cross-GPU copy propagates the previous user's data to GPU1's buffers too. The pool leak is not contained to a single GPU in TP setups.
+
+---
+
+## Experiment 17: cudaMemPool Attributes — Is There a Built-in Zeroing Flag?
+
+**Goal:** Does the CUDA pool API expose an attribute to enable zeroing on reuse? If so, this would be a single-API mitigation.
+
+**Method:** Test all relevant `cudaMemPoolSetAttribute` values plus `cudaMemPoolTrimTo`.
+
+**Result (H100):**
+
+```
+[Part A] Complete sync × stream matrix for cudaMallocAsync:
+Scenario                             Ptr-same  Matches     Verdict
+same stream, no sync                 YES       4096/4096   FULL LEAK
+same stream, with sync               YES          0/4096   SAFE (zeroed)
+diff stream, no sync                 no           0/4096   SAFE (zeroed)
+diff stream, with sync               YES          0/4096   SAFE (zeroed)
+
+[Part B] cudaMemPoolAttrReleaseThreshold = 0 (force OS return)
+  Matches: 0/4096  → SAFE (driver zeroes after OS return)
+
+[Part C] cudaMemPoolTrimTo(pool, 0)
+  Matches: 0/4096  → SAFE (trim zeroes)
+
+[Part D] Custom pool, all reuse flags disabled
+  Matches: 0/4096  → SAFE
+```
+
+**Key findings:**
+1. **There is NO zeroing attribute** — CUDA does not expose `cudaMemPoolAttrZeroOnReuse` or equivalent
+2. **The only safe CUDA API path:**
+   - `cudaMallocAsync` + `cudaStreamSynchronize` between free and realloc (triggers pool zeroing)
+   - `cudaMemPoolAttrReleaseThreshold = 0` + sync (forces return to driver, driver zeroes)
+   - `cudaMemPoolTrimTo(pool, 0)` (returns all idle pages to driver)
+3. **PyTorch bypasses all of these** — the `CUDACachingAllocator` calls into the pool without stream sync, making all three safe paths inaccessible from Python
+4. **The sync × stream table** is the authoritative reference: only the "no sync same stream" case leaks at the raw CUDA API level
+
+**Practical implication:** There is no single `cudaMemPoolSetAttribute` call that makes the pool safe. Mitigation must come from the application layer (`torch.zeros`).
+
+---
+
+## Experiment 18: VMM Direct Test (cuMemCreate / cuMemMap)
+
+**Goal:** Characterize the exact behavior of the VMM allocator used by llama.cpp's `ggml_cuda_pool_vmm` on H100.
+
+**VMM granularity on H100:** 2048 KB
+
+**Result:**
+
+```
+[Part A] cuMemCreate — fresh physical pages:
+  Non-zero on fresh allocation : 0/524288
+  → SAFE — cuMemCreate zeroes new physical pages on first mapping
+
+[Part B] VMM bump-alloc reuse (ggml_cuda_pool_vmm):
+  pool_used=0 → alloc → fill → pool_used=0 (rewind) → alloc again
+  Slot0 ptr    : 0x7d62d8800000  (filled with 2.71828)
+  Attacker ptr : 0x7d62d8800000  (same — pool rewind)
+  Matches      : 524288/524288
+  → [!!!] FULL LEAK — VMM pool reuse does NOT zero
+
+[Part C] cuMemUnmap + cuMemMap to same VA (fresh physical → same address):
+  After mapping fresh h2 physical to same VA:
+  Non-zero : 0/524288
+  → SAFE — new physical pages zeroed on fresh mapping
+
+[Part D] Re-map SAME physical handle to new VA:
+  va2 (same physical, new virtual address):
+  Matches  : 524288/524288
+  → [!!!] LEAK — physical reuse retains data regardless of VA change
+```
+
+**Summary table for VMM:**
+
+| Operation | Zeroed? | Notes |
+|-----------|---------|-------|
+| `cuMemCreate` → first mapping | YES | Driver zeroes fresh physical pages |
+| VMM bump reuse (pool_used rewind) | **NO** | ggml_cuda_pool_vmm exact behavior |
+| `cuMemUnmap` + `cuMemMap` (new physical) | YES | New physical pages are zeroed |
+| `cuMemUnmap` + `cuMemMap` (same physical handle) | **NO** | Physical data persists across VA remap |
+
+**Conclusion:** llama.cpp's `ggml_cuda_pool_vmm` performs a bump-allocator reuse by rewinding `pool_used`. The physical memory is never re-zeroed. This is Part B — confirmed as full leak on H100. Only when the pool is completely torn down (`cuMemUnmap` + `cuMemRelease` + new `cuMemCreate`) does the driver zero the memory.

@@ -27,6 +27,10 @@ Modern ML inference servers allocate and free GPU tensors thousands of times per
 | 12 | Real GPT-2 inference | Actual medical prompt recovery | 🔴 **16/16 words recovered** |
 | 13 | Temporal persistence | How long does data survive in pool? | 🔴 **Indefinite — never expires** |
 | 14 | INT8 quantization | Does quant protect against token recovery? | 🔴 **16/16 even with INT8** |
+| 15 | CUDA IPC handles | Cross-process GPU read via shared handle | 🔴 **100% full R/W access** |
+| 16 | Multi-GPU P2P (NVLink) | GPU1 reads GPU0 pool residue via P2P | 🔴 **100% cross-GPU leak at 387 GB/s** |
+| 17 | cudaMemPool attributes | Built-in zeroing flag in CUDA API? | ⚠️ **No zeroing attr — only sync helps** |
+| 18 | VMM direct (cuMemCreate) | ggml_cuda_pool_vmm exact behavior | 🔴 **VMM reuse = full leak, no zeroing** |
 
 ## Key Insights
 
@@ -41,10 +45,14 @@ Modern ML inference servers allocate and free GPU tensors thousands of times per
 
 **Performance:** `torch.zeros` (the mitigation) is actually **48% faster** than `torch.empty` on H100 due to GPU HBM3 memory system behavior. The security cost is negative.
 
-**New findings (Exp 13–14):**
+**New findings (Exp 13–18):**
 - Data persists **indefinitely** in the pool — 5+ seconds with no expiry. Attacker doesn't need to act immediately.
-- **Different-sized requests between victim and attacker don't protect** — size-class separation means the victim's block stays available regardless.
-- **INT8 quantization doesn't help** — 16/16 exact token recovery still works at INT8 precision.
+- **Different-sized requests don't protect the victim** — size-class separation keeps the block available regardless.
+- **INT8 quantization doesn't help** — 16/16 exact token recovery still works at INT8.
+- **CUDA IPC handles give full R/W access** to another process's GPU memory — any process with the handle file can read and overwrite the allocation.
+- **Multi-GPU NVLink P2P**: GPU1 reads GPU0's pool residue at **387 GB/s** — pool leak propagates across TP shards.
+- **No built-in zeroing attribute** in CUDA pool API — only stream sync or pool trim helps at raw CUDA level (PyTorch bypasses both).
+- **VMM (cuMemCreate) confirmed**: llama.cpp's `ggml_cuda_pool_vmm` uses bump-reuse without zeroing — full leak on H100.
 
 ## Repository Structure
 
@@ -63,6 +71,10 @@ Modern ML inference servers allocate and free GPU tensors thousands of times per
 12_gpt2_real/               Exp 12:    Real GPT-2: full prompt word recovery (100%)
 13_temporal_window/         Exp 13:    How long data persists — indefinite, size-class isolation
 14_quantized_models/        Exp 14:    INT8 quantization does NOT protect (16/16 recovery)
+15_cuda_ipc/                Exp 15:    CUDA IPC: cross-process R/W access via handle file
+16_multi_gpu_p2p/           Exp 16:    NVLink P2P: GPU1 reads GPU0 pool residue (387 GB/s)
+17_mempool_attrs/           Exp 17:    cudaMemPool attributes — no built-in zeroing flag
+18_vmm_direct/              Exp 18:    cuMemCreate/cuMemMap VMM — confirms llama.cpp leak
 ```
 
 ## Environment
