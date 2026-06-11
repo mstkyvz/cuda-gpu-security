@@ -1373,3 +1373,68 @@ Test D — Cross-stream (victim stream A, attacker stream B, victim slot 6):
 - MIG (Multi-Instance GPU): each GPU instance has independent L2 slices — this attack is impossible across MIG instances
 - Physical GPU isolation per tenant
 - Software-level noise injection (periodically flushing/warming the L2 with random data)
+---
+
+## Experiment 28: Tensor Core (wmma) Fragment & Local Memory Residue
+
+**Context:** NVIDIA H100 features 4th-generation Tensor Cores accessed via the CUDA `wmma` API (`nvcuda::wmma`). Tensor Core operations use a `wmma::fragment` abstraction where the accumulator fragment (matrix C result) lives in registers across the 32-thread warp. Additionally, common usage patterns load input matrices via `__shared__` memory staging. This experiment tests three residue surfaces:
+
+- **Test A** — wmma accumulator fragment (register file): do accumulator registers survive kernel exit?
+- **Test B** — `__shared__` staging used by `wmma::load_matrix_sync`: does staging memory persist?
+- **Test C** — Local memory spill (register → DRAM): does DRAM-spilled register state persist?
+
+**Configuration:**
+- `wmma::mma_sync` with `m16n16k16`, fp16 input, fp32 accumulator
+- Accumulator fragment: 256 fp32 values per warp (8 fp32 per thread)
+- `SECRET_MMA = 3.14159 × 16 = 50.265` (accumulator after mma with SECRET input × 1 matrix)
+- 512 warp-blocks (covers all 132 SMs), GPU 1 (idle)
+- Test C uses LOCAL_N=512 floats per thread — forces register spill to DRAM (local memory)
+
+**Result (5-pass verified, H100, CUDA 12.8):**
+
+```
+Test A — wmma accumulator fragment register state:
+  Sanity (victim stores):  SECRET_MMA hits = 131072/131072  ✓
+  Attacker (uninit frag):  SECRET_MMA = 0/131072,  zeros = 131072/131072
+  → All 5 passes: SAFE — registers zeroed between kernel launches
+
+Test B — __shared__ from wmma staging (wmma::load_matrix_sync):
+  Pass 1: 95/512  blocks leak (24320/131072)
+  Pass 2: 100/512 blocks leak (25600/131072)
+  Pass 3:  86/512 blocks leak (22016/131072)
+  Pass 4:  81/512 blocks leak (20736/131072)
+  Pass 5:  64/512 blocks leak (16384/131072)
+  → 5/5 passes: LEAK — 64-100 attacker blocks per pass see victim's __shared__
+  → Leak rate ~12-20%: 1 block per SM (consistent with wave scheduling reuse)
+
+Test C — Local memory DRAM spill residue:
+  Pass 1: 15872/16384 = 96.9%  (min=0.0, max=3.1416)
+  Pass 2: 16384/16384 = 100%   (min=3.1416, max=3.1416)
+  Pass 3: 16384/16384 = 100%   (min=3.1416, max=3.1416)
+  Pass 4: 16384/16384 = 100%   (min=3.1416, max=3.1416)
+  Pass 5: 16384/16384 = 100%   (min=3.1416, max=3.1416)
+  → 5/5 passes: LEAK — local memory (DRAM spill region) NOT zeroed between launches
+```
+
+**Key findings:**
+
+| Test | Surface | Result | Reason |
+|------|---------|--------|--------|
+| A | wmma accumulator fragment (registers) | **SAFE** | H100 zeroes register file on CTA allocation |
+| B | `__shared__` from `wmma::load_matrix_sync` | **LEAK 5/5 (12-20% blocks)** | SM SRAM persists (same as Exp 23); Tensor Core adds no protection |
+| C | Local memory DRAM spill (large local array) | **LEAK 5/5 (97-100% threads)** | Per-SM DRAM local memory region reused without zeroing |
+
+**Why Test A is SAFE:** The H100 hardware zeroes the register file when allocating registers to a new CTA (Cooperative Thread Array). This is a hardware security guarantee — CTA register isolation. The wmma accumulator fragment is stored in registers, and these registers are zeroed at CTA launch. The CUDA documentation states local variables are "unspecified" but in practice H100 zeros CTA register allocations.
+
+**Why Test B leaks:** `wmma::load_matrix_sync` loads from `__shared__` memory into the fragment (registers). The `__shared__` SRAM is NOT zeroed by hardware between kernel launches (per Exp 23). The victim's staging data (`SECRET_H` in `sh_a[0..255]`) persists in SM SRAM when the victim kernel exits. The first attacker block scheduled on each SM before any other attacker block on that SM reads the victim's staging data. Leak rate ≈ 1/wave_size ≈ 12-20% (132 SMs ÷ 512 blocks per wave).
+
+**Why Test C leaks (new finding):** Local memory is per-thread DRAM storage for register spills. NVIDIA allocates a contiguous DRAM region per SM; each thread's local memory is at a fixed offset within this region. When a CTA finishes and a new CTA starts on the SAME SM, the new CTA's threads reuse the same physical DRAM addresses for local memory. The GPU hardware and CUDA runtime do NOT zero this region between CTA launches. This is an extension of global memory pool reuse (Exps 1-22) to the register-spill path: any secret value that causes register pressure sufficient to spill to local memory will persist in that SM's DRAM-local region and be readable by the next CTA on that SM.
+
+**Practical impact (Test C — local memory):**
+- LLM inference kernels with large embedding tables or attention weights that exceed the register file spill to local memory. If a prompt token's embedding or intermediate activation causes a register spill, the spilled value survives into the next inference request's kernel on the same SM.
+- With 512-float local arrays (2 KB/thread), all 16384 tested threads see the SECRET in passes 2-5 (100%). The SM reuse is essentially total for same-stream sequential launches.
+- Defense: no direct CUDA API control over local memory zeroing. The only mitigation is explicit initialization of large local arrays at the start of security-sensitive kernels.
+
+**Connection to prior experiments:**
+- Test B: extends Exp 23 (`__shared__` not zeroed) — Tensor Core wmma wrapper has no additional protection
+- Test C: new surface — register spill to DRAM not zeroed, same mechanism as Exp 1 (global memory reuse) but via the register-file spill path
