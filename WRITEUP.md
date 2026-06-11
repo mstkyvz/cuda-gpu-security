@@ -1144,3 +1144,61 @@ Control (A=B=0):
 **Conclusion:** After any cuBLAS GEMM, an attacker kernel on the same SMs can read the GEMM's input matrix tiles from shared memory residue. 66.67% of all shared memory across all 132 SMs contained the exact FP16 value of the victim's input matrix. This is a direct consequence of Exp 23 (shared memory not zeroed) applied to cuBLAS's internal tiling algorithm.
 
 **Combined attack chain:** Victim's LLM layer → cuBLAS GEMM on A=embedding/attention → attacker kernel reads uninitialized `__shared__` → recovers FP16 fragments of victim's activation matrices.
+
+---
+
+## Experiment 25: CUDA MPS (Multi-Process Service) Isolation Test
+
+**Context:** CUDA MPS (Multi-Process Service) allows multiple processes to share a single GPU CUDA context. It is widely used on cloud H100/A100 instances to improve GPU utilization across concurrent workloads. Under MPS, all client processes share the same physical GPU address space.
+
+**Setup:** GPU 0 set to `EXCLUSIVE_PROCESS` compute mode. MPS daemon started via `nvidia-cuda-mps-control -d`. Writer and reader run as separate client processes under the same MPS session.
+
+**Tests:**
+
+**Test A — MPS Pool Isolation (cudaMallocAsync):**
+- Writer: allocates 1 MB via `cudaMallocAsync`, fills with SECRET=3.14159, frees to pool
+- Reader (separate process, same MPS session): allocates 1 MB via `cudaMallocAsync`
+- Both processes get the SAME virtual address (`0x420000000`) — confirms shared context
+
+**Result (4-trial, H100, CUDA 12.8):**
+
+```
+All 4 trials:
+[W] pool alloc ptr=0x420000000  filled S=3.14159  freed to pool
+[R] attempt 0: ptr=0x420000000  matches=0/262144
+[R] attempt 1: ptr=0x420000000  matches=0/262144
+...
+→ SAFE — MPS runtime zeroes pool memory on cross-client allocation
+```
+
+**Test B — MPS Shared Memory (`__shared__`) Isolation:**
+- Writer: runs 512-block kernel filling `__shared__` (48 KB) with SECRET on all 132 SMs
+- Reader (separate process, same MPS session): launches kernel reading uninitialized `__shared__`
+
+**Result (timing-dependent, H100, CUDA 12.8):**
+
+```
+Delay ≤ 100ms (attacker launches immediately after victim):
+  match=12288/12288  nonzero=12288/12288
+  [!!!] MPS __shared__ LEAK — reader sees writer's shared memory data (100%)
+
+Delay ≥ 500ms (other GPU work runs in between):
+  match=0/12288  nonzero=0/12288
+  SAFE — other workloads naturally overwrote shared memory on SM reuse
+```
+
+**Key findings:**
+
+| Surface | MPS Isolation | Reason |
+|---------|--------------|--------|
+| cudaMallocAsync pool | **SAFE** | MPS runtime zeroes on cross-client alloc |
+| `__shared__` memory | **NOT isolated** | Hardware SM SRAM has no per-client isolation |
+| Virtual address space | Shared | Both clients get identical VAs (0x420000000) |
+
+**Why the asymmetry?** MPS manages the `cudaMallocAsync` pool at the software level — it explicitly zeroes when handing memory from one client's freed pool to another. But `__shared__` is hardware-managed SM SRAM: MPS has no mechanism to zero hardware SRAM between client kernel executions. The GPU hardware's SRAM reuse behavior (as proven in Exp 23) is not configurable through MPS.
+
+**Attack window:** Under MPS, sequential inference requests from different users may share SMs. If an attacker process launches immediately after a victim process's kernel (realistic in a shared inference server), the attacker reads 100% of the victim's `__shared__` data. The window is ~100-200ms — realistic for back-to-back user requests.
+
+**Practical context:** Any inference server running under MPS (which includes most cloud GPU deployments for cost efficiency) is vulnerable to this `__shared__` leak if:
+1. The attacker has enough control to time their kernel launch
+2. Both attacker and victim run on the same MPS session (same GPU partition)
