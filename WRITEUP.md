@@ -1438,3 +1438,58 @@ Test C — Local memory DRAM spill residue:
 **Connection to prior experiments:**
 - Test B: extends Exp 23 (`__shared__` not zeroed) — Tensor Core wmma wrapper has no additional protection
 - Test C: new surface — register spill to DRAM not zeroed, same mechanism as Exp 1 (global memory reuse) but via the register-file spill path
+---
+
+## Experiment 29: CUDA IPC Cross-Process GPU Memory Isolation
+
+**Context:** `cudaIpcGetMemHandle` / `cudaIpcOpenMemHandle` allow two separate OS processes to share a GPU buffer without copying. Process A exports a 64-byte opaque handle; process B opens it via `cudaIpcOpenMemHandle` and receives a pointer to A's physical DRAM pages. This experiment tests what data process B observes depending on when A writes and when B opens the handle.
+
+**Tests:**
+
+**Test A — Direct share (write SECRET → export handle → B opens and reads):**
+- Process A: `cudaMalloc` + fill with `SECRET=3.14159` + `cudaIpcGetMemHandle` → signal B
+- Process B: `cudaIpcOpenMemHandle` → `cudaMemcpy` to host → count SECRET hits
+
+**Test B — Pool residue via IPC (pool alloc → fill SECRET → free → re-alloc → export):**
+- Process A: `cudaMallocAsync` (pool) + fill SECRET + free → re-alloc from same pool → copy to `cudaMalloc` buffer → export handle
+- Tests whether pool residue (SECRET in re-allocated pool block) leaks cross-process via IPC
+
+**Test C — Lazy-open (export EMPTY buffer → write SECRET after signal → B opens later):**
+- Process A: `cudaMalloc` + zero + export handle → signal B → fill SECRET (AFTER B is notified)
+- Process B: opens handle AFTER writer has written SECRET
+- Tests whether IPC handle is a "snapshot at export time" or a "live physical mapping"
+
+**Result (5-pass verified, H100, CUDA 12.8, two-process fork+exec):**
+
+```
+Test A — Direct share:
+  Pass 1-5: 262144/262144 each (100% SECRET)
+  → [!!!] LEAK: IPC maps physical DRAM pages directly, no zeroing on open
+
+Test B — Pool residue via IPC:
+  Pass 1-5: 0/262144 each (0%)
+  → SAFE: pool residue cannot leak cross-process via IPC/cudaMalloc pathway
+
+Test C — Lazy-open (live mapping):
+  Pass 1-5: 262144/262144 each (100% SECRET)
+  → [!!!] LEAK: IPC handle is live physical-page mapping — post-export writes immediately visible
+```
+
+**Key findings:**
+
+| Test | Scenario | Result | Reason |
+|------|----------|--------|--------|
+| A | Write then share | 100% LEAK 5/5 | IPC maps physical pages, no zeroing |
+| B | Pool residue via IPC | SAFE 5/5 | cudaMalloc IPC buffer is fresh; pool residue blocked at cudaMalloc boundary |
+| C | Lazy-open (live mapping) | 100% LEAK 5/5 | IPC handle encodes physical page — write-after-export immediately visible |
+
+**Why Test A leaks:** By design. `cudaIpcMemHandle` encodes the physical DRAM page address. `cudaIpcOpenMemHandle` maps those pages into the recipient's VA space. No data is copied or zeroed. Process B directly accesses A's DRAM pages at the hardware level.
+
+**Why Test B is SAFE:** IPC export requires a `cudaMalloc` pointer (pool allocations via `cudaMallocAsync` cannot be directly exported — IPC only supports stable physical allocations). The writer copies the pool block to a fresh `cudaMalloc` buffer for export. The `cudaMalloc` allocation provides a clean buffer, and the observed result (0/262144) confirms that pool residue does not cross process boundaries via this IPC+cudaMalloc pathway.
+
+**Why Test C leaks:** The handle encodes the physical page at export time. The writer still writes to those pages after export. Process B's mapping points to the SAME physical DRAM — any writes after export are immediately visible. This enables **real-time covert-channel communication** between two processes sharing an IPC handle, with no CUDA synchronization primitives required (undetectable by CUDA runtime event tracing).
+
+**Security implications:**
+- Test A: CUDA IPC provides no confidentiality — if an attacker process obtains an IPC handle (via handle injection, compromised MPS coordinator, or driver exploit), it reads the victim's GPU buffer completely.
+- Test C: Write-after-export visibility enables covert channels between cooperating malicious processes on shared GPU infrastructure.
+- Test B (SAFE): Pool residue cross-process via IPC is blocked at the `cudaMalloc` allocation boundary — a positive isolation finding.

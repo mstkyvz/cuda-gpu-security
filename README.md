@@ -41,6 +41,7 @@ Modern ML inference servers allocate and free GPU tensors thousands of times per
 | 26 | CUDA Graphs buffer residue | Pool alloc inside capture, __shared__ after graph kernel | 🔴 **Test C: 100% pool residue (pre-graph SECRET); Test D: 100% __shared__ leak** |
 | 27 | L2 cache timing side-channel | Prime+Probe: infer victim's memory access pattern via L2 latency | 🔴 **Avg 92% inference (13–16/16 secrets per run); differential timing; cross-stream L2 NOT isolated** |
 | 28 | Tensor Core wmma residue | wmma fragment (regs), __shared__ staging, local mem spill | 🔴 **Reg: SAFE; __shared__ staging: LEAK 12-20% blocks; local mem spill: LEAK 97-100%** |
+| 29 | CUDA IPC cross-process isolation | cudaIpcGetMemHandle: direct share, pool residue, lazy-open | 🔴 **A: LEAK 100%; B: SAFE; C: LEAK 100% (live mapping post-export)** |
 
 ## Key Insights
 
@@ -111,6 +112,7 @@ Modern ML inference servers allocate and free GPU tensors thousands of times per
 26_cuda_graphs/             Exp 26:    CUDA Graphs pool (pre-graph residue LEAKS) + __shared__ (LEAKS)
 27_l2_timing/               Exp 27:    GPU L2 Prime+Probe timing (avg 92% secret inference, differential timing, cross-stream)
 28_tensor_core/             Exp 28:    Tensor Core wmma fragment/shared/local-mem residue
+29_cuda_ipc/                Exp 29:    CUDA IPC cross-process GPU memory isolation
 ```
 
 ## Environment
