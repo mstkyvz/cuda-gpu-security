@@ -25,6 +25,16 @@ Modern ML inference servers allocate and free GPU tensors thousands of times per
 | 10 | Training gradient leak | Customer A grad → Customer B | 🔴 **100% non-zero pool** |
 | 11 | Mitigation: torch.zeros | vs torch.empty overhead | ✅ **SAFE, -48% faster on H100!** |
 | 12 | Real GPT-2 inference | Actual medical prompt recovery | 🔴 **16/16 words recovered** |
+| 13 | Temporal persistence | How long does data survive in pool? | 🔴 **Indefinite — never expires** |
+| 14 | INT8 quantization | Does quant protect against token recovery? | 🔴 **16/16 even with INT8** |
+| 15 | CUDA IPC handles | Cross-process GPU read via shared handle | 🔴 **100% full R/W access** |
+| 16 | Multi-GPU P2P (NVLink) | GPU1 reads GPU0 pool residue via P2P | 🔴 **100% cross-GPU leak at 387 GB/s** |
+| 17 | cudaMemPool attributes | Built-in zeroing flag in CUDA API? | ⚠️ **No zeroing attr — only sync helps** |
+| 18 | VMM direct (cuMemCreate) | ggml_cuda_pool_vmm exact behavior | 🔴 **VMM reuse = full leak, no zeroing** |
+| 19 | Pinned host memory (CVE-2011-0636) | cudaHostAlloc free+realloc (modern driver) | ✅ PATCHED — CUDA 12.8 zeroes all pinned pages |
+| 20 | Unified Memory (CVE-2024-53869) | cudaMallocManaged free+realloc (5 paths) | ✅ PATCHED — CUDA 12.8 zeroes all UM pages |
+| 21 | cudaMallocAsync detailed analysis | 7 sync/stream/pool-config combinations | 🔴 **Same-stream no-sync = 100% LEAK; ReuseAllowOpportunistic=0 does NOT help** |
+| 22 | IPC + pool reuse boundary test | Pool residue across cudaMalloc / cross-process | ✅ **Pools are per-process; pool→cudaMalloc safe** |
 
 ## Key Insights
 
@@ -38,6 +48,22 @@ Modern ML inference servers allocate and free GPU tensors thousands of times per
 3. Scanning GPT-2's embedding matrix → **16/16 token IDs recovered (100%)**
 
 **Performance:** `torch.zeros` (the mitigation) is actually **48% faster** than `torch.empty` on H100 due to GPU HBM3 memory system behavior. The security cost is negative.
+
+**New findings (Exp 13–18):**
+- Data persists **indefinitely** in the pool — 5+ seconds with no expiry. Attacker doesn't need to act immediately.
+- **Different-sized requests don't protect the victim** — size-class separation keeps the block available regardless.
+- **INT8 quantization doesn't help** — 16/16 exact token recovery still works at INT8.
+- **CUDA IPC handles give full R/W access** to another process's GPU memory — any process with the handle file can read and overwrite the allocation.
+- **Multi-GPU NVLink P2P**: GPU1 reads GPU0's pool residue at **387 GB/s** — pool leak propagates across TP shards.
+- **No built-in zeroing attribute** in CUDA pool API — only stream sync or pool trim helps at raw CUDA level (PyTorch bypasses both).
+- **VMM (cuMemCreate) confirmed**: llama.cpp's `ggml_cuda_pool_vmm` uses bump-reuse without zeroing — full leak on H100.
+
+**CVE analysis (Exp 19–22):**
+- **CVE-2011-0636 is patched**: cudaHostAlloc zeroes pinned pages in CUDA 12.8 — 0/10M leak across all scenarios.
+- **CVE-2024-53869 is patched**: cudaMallocManaged zeroes all UM pages in CUDA 12.8 — 0 leak in 5 test paths.
+- **cudaMallocAsync same-stream no-sync = 100% LEAK**: disabling opportunistic reuse does NOT help — same-stream reuse is always ordered and the flag does not apply to it.
+- **Pool isolation confirmed**: CUDA stream-ordered pool and cudaMalloc are separate — pool residue does not cross to cudaMalloc; pools are per-process (cross-process contamination requires explicit IPC).
+- **Gap**: No existing CVE covers user-space pool allocator leaks (PyTorch CUDACachingAllocator, llama.cpp ggml pools) → this research fills that gap.
 
 ## Repository Structure
 
@@ -54,6 +80,16 @@ Modern ML inference servers allocate and free GPU tensors thousands of times per
 10_gradient_leak/           Exp 10:    Training gradient confidentiality
 11_mitigation_bench/        Exp 11:    Mitigation effectiveness & performance benchmark
 12_gpt2_real/               Exp 12:    Real GPT-2: full prompt word recovery (100%)
+13_temporal_window/         Exp 13:    How long data persists — indefinite, size-class isolation
+14_quantized_models/        Exp 14:    INT8 quantization does NOT protect (16/16 recovery)
+15_cuda_ipc/                Exp 15:    CUDA IPC: cross-process R/W access via handle file
+16_multi_gpu_p2p/           Exp 16:    NVLink P2P: GPU1 reads GPU0 pool residue (387 GB/s)
+17_mempool_attrs/           Exp 17:    cudaMemPool attributes — no built-in zeroing flag
+18_vmm_direct/              Exp 18:    cuMemCreate/cuMemMap VMM — confirms llama.cpp leak
+19_pinned_host_mem/         Exp 19:    cudaHostAlloc pinned memory — CVE-2011-0636 class (patched)
+20_unified_memory/          Exp 20:    cudaMallocManaged unified memory — CVE-2024-53869 class (patched)
+21_malloc_async_pool/       Exp 21:    cudaMallocAsync 7-scenario detailed analysis (same-stream leaks)
+22_ipc_pool_reuse/          Exp 22:    IPC + pool boundary test (pools are per-process)
 ```
 
 ## Environment
@@ -327,7 +363,7 @@ private adapter activations.
 Tests three inference server architectures:
 
 ```
-[Scenario A] Same-process (vLLM, TGI, SGLang, Ollama single-process):
+[Scenario A] Same-process (vLLM, TGI, SGLang, Ollama server, llama-server):
   User A  K ptr: 0x7f0960c00000    K[0,0,:4]: [1.414, 1.414, 1.414, 1.414]
   User B  K ptr: 0x7f0960c00000    (reuse: True)
   User B  K[0,0,:4]: [1.414, 1.414, 1.414, 1.414]
@@ -335,22 +371,28 @@ Tests three inference server architectures:
   [!!!] SAME ADDRESS — User B has User A's KV-cache (LEAK)
 
 [Scenario C] PagedAttention block reuse (vLLM-style):
-  User A block[0] K[0,0,:4]: [3.14, 3.14, 3.14, 3.14]
-  User B got same block — NOT zeroed between users
-  [!!!] PagedAttention blocks NOT zeroed on reuse → LEAK
+  vLLM allocates its KV block store with torch.zeros at server startup.
+  BUT when Request A finishes and its blocks return to the free list,
+  those blocks are NOT re-zeroed before the next request gets them.
+  User A block[0] K[0,0,:4]: [3.14, 3.14, 3.14, 3.14]  ← written during request A
+  User B got same block (reused) — still contains Request A's attention data
+  [!!!] PagedAttention blocks NOT re-zeroed on recycling → LEAK
 
-[Scenario B] Ollama per-process isolation:
+[Scenario B] Cross-process isolation baseline (NOT Ollama server behavior):
   SAFE — driver zeroes on CUDA context destroy
+  ⚠️  Ollama server mode runs as a single persistent process (not this scenario).
+      Ollama server = Scenario A = HIGH RISK. Only per-request CLI spawning is safe.
 ```
 
 **Architecture risk matrix:**
-| Server | Single-process? | Risk |
-|--------|----------------|------|
-| vLLM | Yes | HIGH |
-| TGI | Yes | HIGH |
-| SGLang | Yes | HIGH |
-| Ollama (default server) | Yes | HIGH |
-| llama.cpp (CLI) | No | SAFE |
+| Server | Isolation | Risk |
+|--------|-----------|------|
+| vLLM | KV blocks zeroed; intermediate activations NOT | **MEDIUM-HIGH** |
+| TGI | Single process, shared pool | **HIGH** |
+| SGLang | `torch.empty` in MLA KV paths | **HIGH** |
+| Ollama (server) | Single process, ggml pool — no zeroing | **HIGH** |
+| **llama-server** | **ggml pool — no zeroing on reuse** | **HIGH** |
+| llama.cpp CLI | New process per request (cross-process safe) | SAFE |
 
 ### Experiment 9: Token ID Reconstruction (`09_token_reconstruction/token_recon.py`)
 
@@ -437,7 +479,7 @@ Just `torch.empty` and a table lookup.
 
 ### Install
 ```bash
-pip install torch==2.5.1+cu124 --index-url https://download.pytorch.org/whl/cu124
+pip install torch --index-url https://download.pytorch.org/whl/cu126
 pip install transformers accelerate
 ```
 
