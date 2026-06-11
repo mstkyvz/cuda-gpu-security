@@ -336,7 +336,7 @@ private adapter activations.
 Tests three inference server architectures:
 
 ```
-[Scenario A] Same-process (vLLM, TGI, SGLang, Ollama single-process):
+[Scenario A] Same-process (vLLM, TGI, SGLang, Ollama server, llama-server):
   User A  K ptr: 0x7f0960c00000    K[0,0,:4]: [1.414, 1.414, 1.414, 1.414]
   User B  K ptr: 0x7f0960c00000    (reuse: True)
   User B  K[0,0,:4]: [1.414, 1.414, 1.414, 1.414]
@@ -344,12 +344,17 @@ Tests three inference server architectures:
   [!!!] SAME ADDRESS — User B has User A's KV-cache (LEAK)
 
 [Scenario C] PagedAttention block reuse (vLLM-style):
-  User A block[0] K[0,0,:4]: [3.14, 3.14, 3.14, 3.14]
-  User B got same block — NOT zeroed between users
-  [!!!] PagedAttention blocks NOT zeroed on reuse → LEAK
+  vLLM allocates its KV block store with torch.zeros at server startup.
+  BUT when Request A finishes and its blocks return to the free list,
+  those blocks are NOT re-zeroed before the next request gets them.
+  User A block[0] K[0,0,:4]: [3.14, 3.14, 3.14, 3.14]  ← written during request A
+  User B got same block (reused) — still contains Request A's attention data
+  [!!!] PagedAttention blocks NOT re-zeroed on recycling → LEAK
 
-[Scenario B] Ollama per-process isolation:
+[Scenario B] Cross-process isolation baseline (NOT Ollama server behavior):
   SAFE — driver zeroes on CUDA context destroy
+  ⚠️  Ollama server mode runs as a single persistent process (not this scenario).
+      Ollama server = Scenario A = HIGH RISK. Only per-request CLI spawning is safe.
 ```
 
 **Architecture risk matrix:**
@@ -447,7 +452,7 @@ Just `torch.empty` and a table lookup.
 
 ### Install
 ```bash
-pip install torch==2.5.1+cu124 --index-url https://download.pytorch.org/whl/cu124
+pip install torch --index-url https://download.pytorch.org/whl/cu126
 pip install transformers accelerate
 ```
 

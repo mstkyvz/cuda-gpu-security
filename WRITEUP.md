@@ -276,7 +276,7 @@ Non-zero: 1,048,576 / 1,048,576  (100.0%)  — full leak
 ```
 
 **Scenario B — PagedAttention block reuse:**
-PagedAttention divides KV-cache into fixed-size blocks (typically 16 tokens × head_dim). When a request completes, its blocks are returned to the free pool. The next request receives these blocks via `torch.empty` — not zeroed. Block contents from the previous request are fully visible.
+PagedAttention pre-allocates the entire KV block store as one large tensor (vLLM uses `torch.zeros` for this initial allocation). Requests write into specific "slots" within this tensor. When a request completes, its slots return to the BlockAllocator's free list — they are **not re-zeroed** before the next request receives them. The initial `torch.zeros` only zeroes the store at server startup; after Request A writes its attention keys/values, those values persist in the recycled slots that Request B receives.
 
 **Architecture risk matrix:**
 
@@ -295,7 +295,7 @@ PagedAttention divides KV-cache into fixed-size blocks (typically 16 tokens × h
 
 **llama.cpp correction:** The `ggml_cuda_pool_leg` and `ggml_cuda_pool_vmm` implementations in `ggml-cuda.cu` both return memory without zeroing on reuse. The VMM pool's `free()` merely decrements `pool_used` and `alloc()` increments it — no `cudaMemset` ever called. `llama-server` running multiple users is therefore vulnerable. Only the CLI tool (which spawns a fresh process per invocation, destroying the CUDA context between users) is safe.
 
-**Conclusion:** All major Python-based inference servers are at risk. They run single-process with a shared PyTorch allocator pool. Any user on the same server can potentially access previous users' KV-cache and activation data.
+**Conclusion:** All major inference servers — both Python-based (vLLM, TGI, SGLang) and C++-based (llama-server, Ollama) — are at risk when running multiple users in the same process. Any user on the same server can potentially access previous users' KV-cache, activation data, and embedding outputs.
 
 ---
 
@@ -477,7 +477,7 @@ Full prompt vocabulary recovered from leaked GPU memory!
 
 **Conclusion:** Using actual GPT-2 weights and a realistic confidential prompt, we recovered all 16 words of the victim's prompt from leaked GPU pool memory. The attack requires:
 1. The attacker and victim share the same inference server process
-2. The attacker submits a request immediately after the victim (pool block timing)
+2. The attacker submits a request of the same tensor shape as the victim (targets the correct size-class block); based on Experiment 13, timing is flexible — differently-sized intervening requests do not evict the victim's block
 3. The attacker reads their `torch.empty` intermediate buffers before overwriting
 
 No model weights need to be modified. No privileged access to the server is required beyond being a normal API user.
@@ -549,7 +549,7 @@ This is every default deployment of vLLM, TGI, SGLang, and Ollama in server mode
 
 - Per-request process spawning (new `llama.cpp` process per user)
 - Container-per-user with separate CUDA contexts
-- Inference servers that use `torch.zeros` for KV-cache allocation
+- Inference servers that re-zero KV blocks on every recycle (not just initial allocation)
 - Servers running `PYTORCH_NO_CUDA_MEMORY_CACHING=1` (223% overhead — impractical)
 
 ### Attack Difficulty
@@ -561,7 +561,7 @@ This is every default deployment of vLLM, TGI, SGLang, and Ollama in server mode
 | Requires special hardware access | No |
 | Requires modifying server | No |
 | Attacker position required | Normal API user on shared inference server |
-| Timing constraints | Submit request immediately after target (sub-second window) |
+| Timing constraints | **None for different-size requests** — victim's block persists indefinitely in its size class. Same-size requests compete, but data persists across any gap of differently-sized traffic. |
 | Computational cost | O(vocab × dim) per token — milliseconds on any GPU |
 | Detection difficulty | Indistinguishable from normal inference requests |
 
