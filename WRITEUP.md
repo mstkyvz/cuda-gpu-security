@@ -1604,3 +1604,86 @@ Test B — HBM bandwidth contention with victim running 1s (5 passes):
 - CPU: simultaneous multithreading (SMT) allows cycle-accurate timing side-channels via shared execution units
 - GPU: SM-level co-scheduling achieves similar effect — victim's CTA presence measurably degrades attacker throughput
 - GPU channel is coarser (3ms windows, 2x magnitude vs CPU cycle-accurate channels), but the principle is the same: shared SM execution resources leak occupancy information
+
+---
+
+## Experiment 32: NVLink P2P Residue
+
+**Context:** GPU 0 and GPU 1 are connected via NVLink 4.0 (NV18 — 18 NVLink lanes, 900 GB/s bidirectional bandwidth). `cudaDeviceEnablePeerAccess` maps one GPU's DRAM pages into another GPU's virtual address space, allowing direct load/store access. `cudaMemcpyPeer` transfers data across NVLink without CPU involvement. Key security question: does NVLink P2P introduce any zeroing guarantees, or does data transfer as raw DRAM bytes? Can pool residue (Exps 1-22) propagate across the NVLink fabric?
+
+**Setup:**
+- GPU 0: H100 80GB HBM3, Nemotron training at 15% utilization
+- GPU 1: H100 80GB HBM3, idle
+- NVLink 4.0 NV18 (18 lanes), 900 GB/s bidirectional
+- cudaDeviceEnablePeerAccess(0,0) from GPU 1, cudaDeviceEnablePeerAccess(1,0) from GPU 0
+- Both directions confirmed: P2P: GPU0->GPU1: YES, GPU1->GPU0: YES
+
+**Tests:**
+
+- **A**: P2P `cudaMemcpyPeer` — does destination get zeroed before transfer, or is source data copied as-is?
+- **B**: P2P direct pointer — GPU 1 kernel reads GPU 0 memory via P2P-mapped pointer (not copy, direct hardware load)
+- **C**: Cross-device pool — GPU 0 fills SECRET, `cudaFree`; GPU 1 pool-allocs same size — does GPU 1 get GPU 0's freed physical pages?
+- **D**: P2P write coherence — GPU 1 kernel writes SECRET to GPU 0 address via P2P pointer; GPU 0 reads it back
+- **E**: Pool residue via P2P staging — GPU 0 same-stream no-sync pool has SECRET residue; staged to `cudaMalloc` buffer; GPU 1 P2P-reads staging buffer
+
+**Result (5-pass verified, H100, NVLink 4.0, CUDA 12.8):**
+
+```
+Test A — P2P cudaMemcpyPeer (5 passes, all identical):
+  GPU0 d_g0=SECRET, GPU1 d_g1=DECOY=66.0, cudaMemcpyPeer(d_g1, 1, d_g0, 0)
+  GPU1 d_g1 after P2P copy: SECRET=262144/262144  DECOY=0/262144
+  -> P2P copy transfers data correctly with no zeroing of source or destination
+
+Test B — P2P direct pointer read (5 passes, all identical):
+  GPU0 d_g0=SECRET, GPU1 p2p_read(d_g0) -> d_local
+  Hits: 262144/262144 each pass
+  -> GPU1 kernel directly reads GPU0 DRAM via NVLink hardware load
+
+Test C — Cross-device pool residue (5 passes, all identical):
+  GPU0 cudaMalloc+fill SECRET+cudaFree; GPU1 cudaMallocAsync same size
+  GPU1 allocation: SECRET=0/262144 each pass
+  -> SAFE: GPU pools are strictly per-device; GPU1 never receives GPU0 DRAM pages
+
+Test D — P2P write coherence (5 passes, all identical):
+  GPU0 cudaMalloc+zero; GPU1 p2p_write(d_g0, SECRET); GPU0 reads d_g0
+  GPU0 after P2P write: SECRET=262144/262144 each pass
+  -> NVLink writes are immediately coherent; GPU0 sees GPU1's writes without explicit sync
+
+Test E — Pool residue via P2P+staging (5 passes, all identical):
+  GPU0 pool: alloc+fill SECRET+free(no-sync)+realloc -> residue 262144/262144
+  Staged to GPU0 cudaMalloc via cudaMemcpy D2D (no zeroing on D2D copy)
+  GPU1 P2P read of staging buffer: SECRET=262144/262144 each pass
+  Note: cudaMallocAsync pool pointers are NOT directly P2P-accessible;
+        only cudaMalloc allocations support cross-device P2P mapped access
+  -> Pool residue propagates via P2P IF staged through a cudaMalloc buffer
+```
+
+**Key findings:**
+
+| Test | Result | Detail |
+|------|--------|--------|
+| A | TRANSPARENT 5/5 | cudaMemcpyPeer copies raw DRAM bytes; no zeroing on source or destination |
+| B | P2P READ WORKS 5/5 | GPU1 kernel reads GPU0 DRAM directly via NVLink hardware load |
+| C | SAFE 5/5 | GPU pools are per-device; cross-GPU pool reuse is physically impossible |
+| D | COHERENT 5/5 | NVLink P2P writes are immediately coherent (no explicit sync needed) |
+| E | LEAK 5/5 | Pool residue propagates via P2P+staging (cudaMalloc bridge required) |
+
+**Why Test A/B show no zeroing:** NVLink P2P is a hardware-level DRAM-to-DRAM DMA path. `cudaMemcpyPeer` and P2P mapped load/store operations transfer raw bytes without any driver-level zeroing. This is the same guarantee (or lack thereof) as same-device `cudaMemcpy` — data is transferred as-is.
+
+**Why Test C is SAFE:** GPU memory pools (`cudaMallocAsync`) allocate from the device's own HBM. There is no cross-device pool. GPU 0's `cudaFree` returns physical HBM pages to GPU 0's allocator; GPU 1's `cudaMallocAsync` allocates from GPU 1's own HBM allocator. The H100 GPU HBM is not shared between devices — each GPU has its own physically separate HBM3 stack.
+
+**Why Test D is coherent:** NVLink 4.0 implements full cache coherency (GPU-to-GPU). Writes from GPU 1 to GPU 0's address space via P2P are immediately visible to GPU 0 without any explicit memory fence. The NVLink fabric guarantees coherency at the hardware level.
+
+**Why Test E leaks (pool residue via staging):** Two separate findings combine:
+1. Same-stream no-sync pool reuse (Exps 1-22): GPU 0's pool delivers SECRET residue in the re-allocated block.
+2. NVLink P2P transparency (Tests A/B): `cudaMemcpy D2D` copies raw bytes (no zeroing), and GPU 1 P2P-reads raw DRAM bytes.
+The bridge (`cudaMalloc` staging buffer) is required because `cudaMallocAsync` pool pointers are not mapped into peer devices' address spaces. In a real multi-GPU TP inference system, pool residue on one GPU shard can be exfiltrated to another shard via explicit P2P copy operations.
+
+**Hardware constraint on pool P2P access:** `cudaMallocAsync` allocations do NOT support cross-device P2P access (confirmed: direct P2P kernel access to pool pointer causes "illegal memory access"). Only `cudaMalloc` allocations are registered in the peer mapping tables. This is an important isolation boundary: pool residue cannot be directly harvested via P2P without first staging through a `cudaMalloc` buffer.
+
+**Relationship to Exp 16 (Multi-GPU P2P):** Exp 16 tested P2P pool residue via `cudaMallocManaged` and raw P2P copy operations and found 100% leak at 387 GB/s. This experiment confirms and extends that finding: the NVLink fabric is transparent, and pool residue is fully readable across GPUs given a cudaMalloc staging step.
+
+**Security implications for multi-GPU inference:**
+- Tensor Parallel (TP) inference distributes model shards across GPUs and uses `ncclAllReduce` / P2P copies for activations. If an activation buffer is returned to the pool without zeroing, the next TP request's activation copy via NVLink carries the prior request's data.
+- NVLink P2P provides no confidentiality — it is a raw DRAM-to-DRAM path.
+- Cross-device pool isolation IS maintained (GPU 0 pool never leaks to GPU 1 pool allocation), but single-GPU pool residue survives P2P transfer.
