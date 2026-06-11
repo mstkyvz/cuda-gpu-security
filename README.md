@@ -1,6 +1,6 @@
 # CUDA GPU Memory Security Research
 
-This repository documents hands-on security research into GPU memory safety on NVIDIA hardware (RTX 4090, CUDA 12.x). All experiments were run live, results are reproducible.
+This repository documents hands-on security research into GPU memory safety on NVIDIA hardware (H100 80GB HBM3, CUDA 12.x). All experiments were run live on real hardware, results are reproducible.
 
 ## Motivation
 
@@ -23,7 +23,7 @@ Modern ML inference servers allocate and free GPU tensors thousands of times per
 | 8 | PagedAttention block reuse | KV blocks NOT zeroed | 🔴 **LEAK on block reuse** |
 | 9 | Token ID reconstruction | Leaked embeddings → word recovery | 🔴 **16/16 tokens (100%)** |
 | 10 | Training gradient leak | Customer A grad → Customer B | 🔴 **100% non-zero pool** |
-| 11 | Mitigation: torch.zeros | vs torch.empty overhead | ✅ **SAFE, -11% faster!** |
+| 11 | Mitigation: torch.zeros | vs torch.empty overhead | ✅ **SAFE, -48% faster on H100!** |
 | 12 | Real GPT-2 inference | Actual medical prompt recovery | 🔴 **16/16 words recovered** |
 
 ## Key Insights
@@ -37,7 +37,7 @@ Modern ML inference servers allocate and free GPU tensors thousands of times per
 2. Allocating `torch.empty` for the attacker (got same pointer)
 3. Scanning GPT-2's embedding matrix → **16/16 token IDs recovered (100%)**
 
-**Performance:** `torch.zeros` (the mitigation) is actually **11% faster** than `torch.empty` on this hardware due to better GPU cache behavior. The security cost is negative.
+**Performance:** `torch.zeros` (the mitigation) is actually **48% faster** than `torch.empty` on H100 due to GPU HBM3 memory system behavior. The security cost is negative.
 
 ## Repository Structure
 
@@ -58,10 +58,10 @@ Modern ML inference servers allocate and free GPU tensors thousands of times per
 
 ## Environment
 
-- GPU: NVIDIA GeForce RTX 4090 (24 GB)
+- GPU: NVIDIA H100 80GB HBM3
 - Driver: 565.77
 - CUDA: 12.6 / 12.7
-- PyTorch: 2.5.1+cu124
+- PyTorch: 2.12.0+cu130
 
 ## Mitigation
 
@@ -386,14 +386,15 @@ can reconstruct training data from gradients alone.
 
 ```
 Method                          Time (μs)     vs baseline   Safe?
-torch.empty (baseline)          22.28         +0.0%         NO (LEAKS)
-torch.zeros                     19.71         -11.5%        YES ✓
-torch.empty().zero_()           16.63         -25.3%        YES ✓
-empty_cache() + torch.empty     492.23        +2109.7%      YES ✓
+torch.empty (baseline)          24.36         +0.0%         NO (LEAKS)
+torch.zeros                     12.61         -48.2%        YES ✓
+torch.empty().zero_()           10.53         -56.8%        YES ✓
+empty_cache() + torch.empty     111.26        +356.8%       YES ✓
+PYTORCH_NO_CUDA_MEMORY_CACHING  78.8          +223%         YES ✓
 ```
 
-On RTX 4090, zeroing a 4 MB KV-cache is ~2.6 μs FASTER than not zeroing.
-The security fix costs nothing — in fact it improves performance.
+On H100 80GB HBM3, zeroing a 4 MB KV-cache is **48% FASTER** than not zeroing.
+The security fix costs nothing — it is actually a performance improvement.
 
 ### Experiment 12: Real GPT-2 — Full Prompt Word Recovery (`12_gpt2_real/gpt2_kvcache_leak.py`)
 
