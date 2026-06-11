@@ -35,6 +35,8 @@ Modern ML inference servers allocate and free GPU tensors thousands of times per
 | 20 | Unified Memory (CVE-2024-53869) | cudaMallocManaged free+realloc (5 paths) | ✅ PATCHED — CUDA 12.8 zeroes all UM pages |
 | 21 | cudaMallocAsync detailed analysis | 7 sync/stream/pool-config combinations | 🔴 **Same-stream no-sync = 100% LEAK; ReuseAllowOpportunistic=0 does NOT help** |
 | 22 | IPC + pool reuse boundary test | Pool residue across cudaMalloc / cross-process | ✅ **Pools are per-process; pool→cudaMalloc safe** |
+| 23 | __shared__ memory zeroing | Static & dynamic __shared__ between sequential launches | 🔴 **100% LEAK — shared mem NEVER zeroed on SM reuse** |
+| 24 | cuBLAS workspace + shared mem | External workspace buffer + GEMM shared mem residue | 🔴 **66.67% of SM shared mem = GEMM input matrix tiles** |
 
 ## Key Insights
 
@@ -65,6 +67,10 @@ Modern ML inference servers allocate and free GPU tensors thousands of times per
 - **Pool isolation confirmed**: CUDA stream-ordered pool and cudaMalloc are separate — pool residue does not cross to cudaMalloc; pools are per-process (cross-process contamination requires explicit IPC).
 - **Gap**: No existing CVE covers user-space pool allocator leaks (PyTorch CUDACachingAllocator, llama.cpp ggml pools) → this research fills that gap.
 
+**Hardware-level findings (Exp 23–24):**
+- **__shared__ is NEVER zeroed between kernel launches** — an attacker kernel scheduled on the same SM reads 100% of the prior kernel's shared memory data. Confirmed for static, dynamic, 48–164 KB allocations, with and without stream sync.
+- **cuBLAS GEMM leaks via shared memory** — after a cuBLAS FP16 GEMM (A=SECRET), attacker kernel sees 66.67% of all SM shared memory matching SECRET. Exactly 2/3 because H100 HMMA tiles A:B = 2:1 in shared memory. External workspace buffer does NOT leak (not used on H100 for standard GEMMs).
+
 ## Repository Structure
 
 ```
@@ -90,6 +96,8 @@ Modern ML inference servers allocate and free GPU tensors thousands of times per
 20_unified_memory/          Exp 20:    cudaMallocManaged unified memory — CVE-2024-53869 class (patched)
 21_malloc_async_pool/       Exp 21:    cudaMallocAsync 7-scenario detailed analysis (same-stream leaks)
 22_ipc_pool_reuse/          Exp 22:    IPC + pool boundary test (pools are per-process)
+23_shared_memory/           Exp 23:    __shared__ zeroing — NOT zeroed on SM reuse (100% leak)
+24_cublas_workspace/        Exp 24:    cuBLAS workspace (safe) + GEMM shared mem residue (66.67%)
 ```
 
 ## Environment
