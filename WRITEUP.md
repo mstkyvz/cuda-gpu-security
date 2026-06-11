@@ -282,14 +282,18 @@ PagedAttention divides KV-cache into fixed-size blocks (typically 16 tokens × h
 
 | System | Isolation Model | Risk |
 |--------|----------------|------|
-| vLLM | Single process, shared pool | **HIGH** |
+| vLLM | Single process; KV blocks use `torch.zeros` but intermediate activations / embedding outputs use `torch.empty` | **MEDIUM-HIGH** |
 | TGI (HuggingFace) | Single process, shared pool | **HIGH** |
-| SGLang | Single process, shared pool | **HIGH** |
-| Ollama (server mode) | Single process, shared pool | **HIGH** |
-| llama.cpp (CLI per-request) | New process each request | SAFE |
-| Ollama (per-request spawn) | New process each request | SAFE |
+| SGLang | Single process; pool memory uses `torch.empty` in MLA KV paths | **HIGH** |
+| Ollama (server mode) | Single process wrapping llama.cpp, shared ggml pool | **HIGH** |
+| llama.cpp server (`llama-server`) | Single process, ggml pool — NO zeroing on reuse | **HIGH** |
+| llama.cpp CLI (one process per request) | New process each request | SAFE |
 | CUDA MPS setup | Shared context across processes | **HIGH** |
 | Docker-isolated containers | Separate CUDA contexts | SAFE |
+
+**vLLM nuance:** `cache_engine.py` allocates KV blocks with `torch.zeros`, but FlashAttention output buffers (`torch.empty_like`) and embedding lookup outputs are still allocated via the unzeroed pool. The attack demonstrated in Experiment 12 goes through embedding output — not the KV block store — and therefore works despite vLLM's partial mitigation.
+
+**llama.cpp correction:** The `ggml_cuda_pool_leg` and `ggml_cuda_pool_vmm` implementations in `ggml-cuda.cu` both return memory without zeroing on reuse. The VMM pool's `free()` merely decrements `pool_used` and `alloc()` increments it — no `cudaMemset` ever called. `llama-server` running multiple users is therefore vulnerable. Only the CLI tool (which spawns a fresh process per invocation, destroying the CUDA context between users) is safe.
 
 **Conclusion:** All major Python-based inference servers are at risk. They run single-process with a shared PyTorch allocator pool. Any user on the same server can potentially access previous users' KV-cache and activation data.
 
@@ -679,6 +683,70 @@ When reconstructing token IDs from leaked embeddings, the victim allocation must
 11_mitigation_bench/        overhead benchmark for all mitigations
 12_gpt2_real/               full GPT-2 demo with real confidential prompt
 ```
+
+---
+
+---
+
+## Experiment 13: Temporal Persistence Window
+
+**Goal:** How many intervening requests can pass between victim and attacker before the data expires?
+
+**Method:** Victim fills buffer → K intervening allocations of varying sizes → attacker reads.
+
+**Result (H100):**
+
+```
+[Part A] Same-size noise between victim and attacker:
+  Gap=0 (no noise)   : SAME ptr → 100.0% survived
+  Gap=1 same-size    : different ptr → 0.0%  (noise took the block)
+  Gap=2+             : 0.0%
+
+[Part B] Different-size noise (realistic: other users send different-length requests):
+  Gap=0   : 100.0%
+  Gap=1 (50%-size noise)  : SAME ptr → 100.0%  ← different size class = victim still available
+  Gap=1 (200%-size noise) : SAME ptr → 100.0%
+  Gap=4 (50%-size noise)  : SAME ptr → 100.0%
+  Gap=8 (200%-size noise) : SAME ptr → 100.0%
+
+[Part C] Time-based (just wait, no noise):
+  0 ms  → 100.0%
+  10 ms → 100.0%
+  100 ms → 100.0%
+  500 ms → 100.0%
+  1000 ms → 100.0%
+  5000 ms → 100.0%  ← data persists indefinitely
+```
+
+**Key finding:** The PyTorch pool organizes blocks by size class. A victim's block stays in its size-class free list indefinitely — it will not be reused by a different-sized request. An attacker who sends a request of the **same size** as the victim gets the block regardless of how many differently-sized requests arrived in between. Data never expires unless `torch.cuda.empty_cache()` is explicitly called.
+
+**Attack implication:** The attacker does not need to submit a request immediately after the victim. Any subsequent same-sized allocation — even minutes later — returns the same block with the same data. This dramatically widens the timing window for the attack.
+
+---
+
+## Experiment 14: Token Recovery from Quantized (INT8) Embeddings
+
+**Goal:** Does INT8 quantization protect against the embedding leak attack?
+
+**Context:** Many production deployments quantize model weights to INT8 or INT4 (bitsandbytes, AWQ, GPTQ) to reduce memory. If quantization destroys enough precision in the embedding vectors, the nearest-neighbor reconstruction fails.
+
+**Method:** Simulate INT8 symmetric per-row quantization of the embedding table. Victim stores the dequantized embedding output (fp32). Attacker reads the leaked vector and scans the dequantized table.
+
+**Result (H100):**
+
+```
+Method                          Recovered     Notes
+------------------------------------------------------------
+FP32 embeddings                 16/16         Dist=0.0000, perfect
+FP16 embeddings                 16/16         Minimal quantization noise
+INT8 dequantized                16/16         INT8 rounding still unique
+
+[Conclusion] Quantization does NOT break token recovery.
+```
+
+**Why INT8 doesn't help:** Each token's embedding vector has 768 dimensions. Even after INT8 quantization (7-bit mantissa), the distance between different tokens' embeddings remains large relative to the quantization error. The nearest-neighbor scan of the dequantized table — using the same quantization parameters available in the public model checkpoint — recovers all 16 tokens exactly.
+
+**Impact:** Deployments using bitsandbytes INT8 loading are NOT protected against this attack.
 
 ---
 

@@ -25,6 +25,8 @@ Modern ML inference servers allocate and free GPU tensors thousands of times per
 | 10 | Training gradient leak | Customer A grad → Customer B | 🔴 **100% non-zero pool** |
 | 11 | Mitigation: torch.zeros | vs torch.empty overhead | ✅ **SAFE, -48% faster on H100!** |
 | 12 | Real GPT-2 inference | Actual medical prompt recovery | 🔴 **16/16 words recovered** |
+| 13 | Temporal persistence | How long does data survive in pool? | 🔴 **Indefinite — never expires** |
+| 14 | INT8 quantization | Does quant protect against token recovery? | 🔴 **16/16 even with INT8** |
 
 ## Key Insights
 
@@ -38,6 +40,11 @@ Modern ML inference servers allocate and free GPU tensors thousands of times per
 3. Scanning GPT-2's embedding matrix → **16/16 token IDs recovered (100%)**
 
 **Performance:** `torch.zeros` (the mitigation) is actually **48% faster** than `torch.empty` on H100 due to GPU HBM3 memory system behavior. The security cost is negative.
+
+**New findings (Exp 13–14):**
+- Data persists **indefinitely** in the pool — 5+ seconds with no expiry. Attacker doesn't need to act immediately.
+- **Different-sized requests between victim and attacker don't protect** — size-class separation means the victim's block stays available regardless.
+- **INT8 quantization doesn't help** — 16/16 exact token recovery still works at INT8 precision.
 
 ## Repository Structure
 
@@ -54,6 +61,8 @@ Modern ML inference servers allocate and free GPU tensors thousands of times per
 10_gradient_leak/           Exp 10:    Training gradient confidentiality
 11_mitigation_bench/        Exp 11:    Mitigation effectiveness & performance benchmark
 12_gpt2_real/               Exp 12:    Real GPT-2: full prompt word recovery (100%)
+13_temporal_window/         Exp 13:    How long data persists — indefinite, size-class isolation
+14_quantized_models/        Exp 14:    INT8 quantization does NOT protect (16/16 recovery)
 ```
 
 ## Environment
@@ -344,13 +353,14 @@ Tests three inference server architectures:
 ```
 
 **Architecture risk matrix:**
-| Server | Single-process? | Risk |
-|--------|----------------|------|
-| vLLM | Yes | HIGH |
-| TGI | Yes | HIGH |
-| SGLang | Yes | HIGH |
-| Ollama (default server) | Yes | HIGH |
-| llama.cpp (CLI) | No | SAFE |
+| Server | Isolation | Risk |
+|--------|-----------|------|
+| vLLM | KV blocks zeroed; intermediate activations NOT | **MEDIUM-HIGH** |
+| TGI | Single process, shared pool | **HIGH** |
+| SGLang | `torch.empty` in MLA KV paths | **HIGH** |
+| Ollama (server) | Single process, ggml pool — no zeroing | **HIGH** |
+| **llama-server** | **ggml pool — no zeroing on reuse** | **HIGH** |
+| llama.cpp CLI | New process per request (cross-process safe) | SAFE |
 
 ### Experiment 9: Token ID Reconstruction (`09_token_reconstruction/token_recon.py`)
 
