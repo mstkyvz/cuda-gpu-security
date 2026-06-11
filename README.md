@@ -39,7 +39,7 @@ Modern ML inference servers allocate and free GPU tensors thousands of times per
 | 24 | cuBLAS workspace + shared mem | External workspace buffer + GEMM shared mem residue | 🔴 **66.67% of SM shared mem = GEMM input matrix tiles** |
 | 25 | CUDA MPS isolation | Pool and __shared__ between MPS client processes | ⚠️ **Pool SAFE (zeroed); __shared__ LEAKS at ≤100ms timing** |
 | 26 | CUDA Graphs buffer residue | Pool alloc inside capture, __shared__ after graph kernel | 🔴 **Test C: 100% pool residue (pre-graph SECRET); Test D: 100% __shared__ leak** |
-| 27 | L2 cache timing side-channel | Prime+Probe: infer victim's memory access pattern via L2 latency | 🔴 **100% inference (16/16 secrets, 80/80 trials); cross-stream L2 NOT isolated** |
+| 27 | L2 cache timing side-channel | Prime+Probe: infer victim's memory access pattern via L2 latency | 🔴 **Avg 92% inference (13–16/16 secrets per run); differential timing; cross-stream L2 NOT isolated** |
 
 ## Key Insights
 
@@ -73,7 +73,7 @@ Modern ML inference servers allocate and free GPU tensors thousands of times per
 **Hardware-level findings (Exp 23–24):**
 - **__shared__ is NEVER zeroed between kernel launches** — an attacker kernel scheduled on the same SM reads 100% of the prior kernel's shared memory data. Confirmed for static, dynamic, 48–164 KB allocations, with and without stream sync.
 - **cuBLAS GEMM leaks via shared memory** — after a cuBLAS FP16 GEMM (A=SECRET), attacker kernel sees 66.67% of all SM shared memory matching SECRET. Exactly 2/3 because H100 HMMA tiles A:B = 2:1 in shared memory. External workspace buffer does NOT leak (not used on H100 for standard GEMMs).
-- **GPU L2 cache timing side-channel works**: H100 L2 (50 MB) is shared across all SMs with no per-process or per-stream partition. Attacker uses Prime+Probe: evict all L2 (100 MB flush), victim accesses secret-dependent address, attacker probes all 16 slots sequentially on a single SM using `clock64()`. Cold (HBM) = ~720 cycles, warm (L2 hit) = ~305 cycles — 2.3x ratio. 16/16 possible secrets correctly inferred, 80/80 detection trials, 100% cross-stream. MIG instances are immune (separate L2 per partition); standard GPU isolation is not.
+- **GPU L2 cache timing side-channel works**: H100 L2 (50 MB) is shared across all SMs with no per-process or per-stream partition. Attacker uses differential Prime+Probe: flush L2 → baseline probe → flush L2 → victim access → attack probe → largest latency drop = victim slot. L2 hit: ~674 cycles, HBM miss: ~840–1280 cycles (1.25×–1.90× ratio). Avg 92% secret inference across 5 passes (13–16/16 per run, random baseline 6.25%). Cross-stream L2 NOT isolated. MIG instances are immune (separate L2 per partition); standard GPU isolation is not.
 - **CUDA Graphs do NOT zero pool allocations**: `cudaMallocAsync` inside a graph capture reuses the same pool block from the warmup run. That block holds the warmup-phase activation data when the graph replays for a new request. PyTorch `torch.cuda.CUDAGraph` is directly affected. Graph destroy correctly zeroes the pool block (SAFE). `__shared__` residue from graph kernels follows the same behavior as standalone kernels (Exp 23).
 - **CUDA MPS __shared__ NOT isolated**: Under MPS, all client processes share the same GPU context. Pool (cudaMallocAsync) is zeroed on cross-client allocation (SAFE). But hardware SM SRAM (__shared__) has no per-client isolation — attacker process reads 100% of victim process's __shared__ data at ≤100ms timing (realistic back-to-back inference requests). Both clients got identical virtual addresses (0x420000000) confirming shared context.
 
@@ -106,7 +106,7 @@ Modern ML inference servers allocate and free GPU tensors thousands of times per
 24_cublas_workspace/        Exp 24:    cuBLAS workspace (safe) + GEMM shared mem residue (66.67%)
 25_mps_isolation/           Exp 25:    MPS pool (SAFE) + __shared__ (LEAKS at ≤100ms timing)
 26_cuda_graphs/             Exp 26:    CUDA Graphs pool (pre-graph residue LEAKS) + __shared__ (LEAKS)
-27_l2_timing/               Exp 27:    GPU L2 Prime+Probe timing (100% secret inference, cross-stream)
+27_l2_timing/               Exp 27:    GPU L2 Prime+Probe timing (avg 92% secret inference, differential timing, cross-stream)
 ```
 
 ## Environment

@@ -279,15 +279,14 @@ static void test_D(int pass) {
 
     /* Launch graph — fills __shared__ across all 132 SMs */
     CHECK(cudaGraphLaunch(ge, stream));
+    /* Attacker on SAME stream: no gap where other GPU work could overwrite SRAM */
+    read_shared<<<512, 256, 0, stream>>>(d_shm_out, SHM_N);
     CHECK(cudaStreamSynchronize(stream));
 
+    /* Read flag after attacker completes (moved here to avoid stream gap) */
     int h_flag = 0;
     CHECK(cudaMemcpy(&h_flag, d_flag, sizeof(int), cudaMemcpyDeviceToHost));
     printf("  Graph filled __shared__ (flag=%d)\n", h_flag);
-
-    /* Attacker: read uninitialized __shared__ immediately after graph */
-    read_shared<<<512, 256>>>(d_shm_out, SHM_N);
-    CHECK(cudaDeviceSynchronize());
 
     float *h = (float *)malloc(SHM_N * sizeof(float));
     CHECK(cudaMemcpy(h, d_shm_out, SHM_N * sizeof(float), cudaMemcpyDeviceToHost));
@@ -311,9 +310,9 @@ static void test_D(int pass) {
 }
 
 int main() {
-    CHECK(cudaSetDevice(0));
+    CHECK(cudaSetDevice(1));  /* GPU 1: idle, no background processes */
     cudaDeviceProp prop;
-    CHECK(cudaGetDeviceProperties(&prop, 0));
+    CHECK(cudaGetDeviceProperties(&prop, 1));
     printf("=== Experiment 26: CUDA Graphs Intermediate Buffer Residue ===\n");
     printf("    Device: %s  (SMs: %d, compute %d.%d)\n\n",
            prop.name, prop.multiProcessorCount, prop.major, prop.minor);
