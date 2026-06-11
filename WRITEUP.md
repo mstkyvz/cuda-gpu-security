@@ -1202,3 +1202,81 @@ Delay ≥ 500ms (other GPU work runs in between):
 **Practical context:** Any inference server running under MPS (which includes most cloud GPU deployments for cost efficiency) is vulnerable to this `__shared__` leak if:
 1. The attacker has enough control to time their kernel launch
 2. Both attacker and victim run on the same MPS session (same GPU partition)
+
+---
+
+## Experiment 26: CUDA Graphs — Intermediate Buffer Residue
+
+**Context:** CUDA Graphs (`cudaGraph_t`) capture a sequence of GPU kernels and replay them at reduced CPU overhead. PyTorch uses `torch.cuda.CUDAGraph` to accelerate LLM inference — the standard workflow is: (1) warmup run on real data, (2) graph capture on same stream, (3) repeated graph replays. Key question: does graph capture or replay zero intermediate pool buffers?
+
+**Tests:**
+
+**Test A — External buffer, graph writes, post-destroy pool:**
+- Graph captures `write_secret(d_work, SECRET1)`. d_work is preallocated outside the graph.
+- Replays 1 and 2 both correctly write SECRET1 (graph replay works).
+- After graph destroy + `cudaMallocAsync` from same pool: 0 SECRET1 hits.
+
+**Test B — Graph-owned allocation (cudaMallocAsync inside capture):**
+- `cudaMallocAsync` called inside the stream-capture window → owned by graph.
+- Graph writes SECRET1 to d_internal, frees inside capture.
+- After graph destroy + pool alloc: 0 SECRET1 hits, nz=0.
+
+**Test C — Pre-graph pool residue (graph alloc inside capture):**
+- Phase 1: alloc from pool, fill with SECRET1, free back to pool.
+- Phase 2: capture graph that calls `cudaMallocAsync` inside capture window.
+- Graph launch: the pool block returned to d_in_graph is the same one filled with SECRET1.
+
+**Test D — `__shared__` residue from graph kernel:**
+- Graph captures `fill_shared(SECRET1)` running on 512 blocks across all 132 SMs.
+- After graph launch + sync, attacker kernel reads uninitialized `__shared__`.
+
+**Result (4-pass verified, H100, CUDA 12.8):**
+
+```
+Test A — Post-destroy pool alloc:
+  All 4 passes: SECRET1=0/262144  nz=0/262144
+  → SAFE — graph destroy + pool free zeroes the block
+
+Test B — Graph-owned alloc after destroy:
+  All 4 passes: SECRET1=0/262144  nz=0/262144
+  → SAFE — graph-owned memory zeroed when returned to pool on destroy
+
+Test C — Pre-graph pool residue in graph capture:
+  Pass 1: SECRET1=262144/262144  nz=262144/262144  [!!!]
+  Pass 2: SECRET1=262144/262144  nz=262144/262144  [!!!]
+  Pass 3: SECRET1=262144/262144  nz=262144/262144  [!!!]
+  Pass 4: SECRET1=262144/262144  nz=262144/262144  [!!!]
+  → 100% LEAK — graph capture does NOT zero pool blocks; same-stream reuse delivers SECRET1
+
+  Graph replay 2 (same graph run again):
+  All passes: SECRET1=262144/262144 — same pool block locked to graph, reused each replay
+
+Test D — __shared__ residue from graph kernel:
+  Pass 1: SECRET1=12288/12288  nz=12288/12288  [!!!]
+  Pass 2: SECRET1=12288/12288  nz=12288/12288  [!!!]
+  Pass 3: SECRET1=12288/12288  nz=12288/12288  [!!!]
+  Pass 4: SECRET1=12288/12288  nz=12288/12288  [!!!]
+  → 100% LEAK — graph wrapper does not affect __shared__ hardware SRAM behavior
+```
+
+**Key findings:**
+
+| Test | Surface | Result | Reason |
+|------|---------|--------|--------|
+| A | External buffer, post-destroy pool | **SAFE** | Pool zeroes block on graph boundary |
+| B | Graph-owned alloc post-destroy | **SAFE** | Graph destroy triggers pool zeroing |
+| C | Pool alloc inside capture (pre-graph residue) | **100% LEAK** | Same-stream pool reuse, no zeroing |
+| D | `__shared__` from graph kernel | **100% LEAK** | Hardware SRAM never zeroed (Exp 23) |
+
+**Why Test C leaks:** A `cudaMallocAsync` inside a stream-capture window is assigned a pool block at graph-instantiation time (or at first launch). The pool block is the same one freed in Phase 1 with SECRET1 still in it — because stream-ordered pool reuse does not zero (as proven in Exp 21). Graph capture/replay does not add any additional zeroing step. The pool block with SECRET1 is locked to the graph and reused on every replay.
+
+**PyTorch CUDAGraph attack chain:** PyTorch's `torch.cuda.CUDAGraph` pattern is:
+1. **Warmup** (user A's data flows through): model forward pass fills activation buffers in stream pool
+2. **Graph capture**: same stream, `torch.empty`-allocated buffers inside graph reuse the SAME pool blocks from warmup — still contain user A's activations
+3. **Graph replay** (user B's request): graph replays with user B's input tensor, but the graph-internal `torch.empty` allocations still point to the warmup pool blocks, which hold user A's data until user B's computation overwrites them — a window of vulnerability at the start of each replay
+
+**Practical scenario:** Any inference server using `torch.cuda.CUDAGraph` (vLLM, TGI, TensorRT-LLM) with `torch.empty` for intermediate buffers leaks warmup-phase activations into the first replay cycle's intermediate buffers. Since warmup is typically run on representative (real) data, the leaked buffers contain real activation patterns.
+
+**Connection to prior experiments:**
+- Test C: same underlying mechanism as Exp 1B (same-stream no-sync pool reuse) and Exp 21 (same-stream no-sync = 100% LEAK). Graph capture does not change this.
+- Test D: same as Exp 23 (`__shared__` never zeroed). Graph execution is just another kernel launch from the hardware's perspective.

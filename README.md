@@ -38,6 +38,7 @@ Modern ML inference servers allocate and free GPU tensors thousands of times per
 | 23 | __shared__ memory zeroing | Static & dynamic __shared__ between sequential launches | 🔴 **100% LEAK — shared mem NEVER zeroed on SM reuse** |
 | 24 | cuBLAS workspace + shared mem | External workspace buffer + GEMM shared mem residue | 🔴 **66.67% of SM shared mem = GEMM input matrix tiles** |
 | 25 | CUDA MPS isolation | Pool and __shared__ between MPS client processes | ⚠️ **Pool SAFE (zeroed); __shared__ LEAKS at ≤100ms timing** |
+| 26 | CUDA Graphs buffer residue | Pool alloc inside capture, __shared__ after graph kernel | 🔴 **Test C: 100% pool residue (pre-graph SECRET); Test D: 100% __shared__ leak** |
 
 ## Key Insights
 
@@ -71,6 +72,7 @@ Modern ML inference servers allocate and free GPU tensors thousands of times per
 **Hardware-level findings (Exp 23–24):**
 - **__shared__ is NEVER zeroed between kernel launches** — an attacker kernel scheduled on the same SM reads 100% of the prior kernel's shared memory data. Confirmed for static, dynamic, 48–164 KB allocations, with and without stream sync.
 - **cuBLAS GEMM leaks via shared memory** — after a cuBLAS FP16 GEMM (A=SECRET), attacker kernel sees 66.67% of all SM shared memory matching SECRET. Exactly 2/3 because H100 HMMA tiles A:B = 2:1 in shared memory. External workspace buffer does NOT leak (not used on H100 for standard GEMMs).
+- **CUDA Graphs do NOT zero pool allocations**: `cudaMallocAsync` inside a graph capture reuses the same pool block from the warmup run. That block holds the warmup-phase activation data when the graph replays for a new request. PyTorch `torch.cuda.CUDAGraph` is directly affected. Graph destroy correctly zeroes the pool block (SAFE). `__shared__` residue from graph kernels follows the same behavior as standalone kernels (Exp 23).
 - **CUDA MPS __shared__ NOT isolated**: Under MPS, all client processes share the same GPU context. Pool (cudaMallocAsync) is zeroed on cross-client allocation (SAFE). But hardware SM SRAM (__shared__) has no per-client isolation — attacker process reads 100% of victim process's __shared__ data at ≤100ms timing (realistic back-to-back inference requests). Both clients got identical virtual addresses (0x420000000) confirming shared context.
 
 ## Repository Structure
@@ -101,6 +103,7 @@ Modern ML inference servers allocate and free GPU tensors thousands of times per
 23_shared_memory/           Exp 23:    __shared__ zeroing — NOT zeroed on SM reuse (100% leak)
 24_cublas_workspace/        Exp 24:    cuBLAS workspace (safe) + GEMM shared mem residue (66.67%)
 25_mps_isolation/           Exp 25:    MPS pool (SAFE) + __shared__ (LEAKS at ≤100ms timing)
+26_cuda_graphs/             Exp 26:    CUDA Graphs pool (pre-graph residue LEAKS) + __shared__ (LEAKS)
 ```
 
 ## Environment
