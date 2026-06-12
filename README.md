@@ -47,6 +47,8 @@ Modern ML inference servers allocate and free GPU tensors thousands of times per
 | 32 | NVLink P2P residue | P2P zeroing, cross-GPU pool isolation, pool residue via P2P staging | 🔴 **P2P transparent (no zeroing); cross-GPU pool SAFE; pool residue LEAKS via cudaMalloc staging 5/5** |
 | 33 | PyTorch CachingAllocator residue | del tensor -> torch.empty: pool reuse, grad buf, activation buf | 🔴 **LEAK 100% 5/5 (same-stream); empty_cache() SAFE; cross-stream SAFE; grad+activation buf LEAK 100%** |
 | 35 | LLM token reconstruction | GPT-2 embedding/logit residue → exact prompt token recovery | 🔴 **PERFECT LEAK 5/5 — full prompt reconstructed token-by-token from pool residue; logits exact match** |
+| 36 | torch.compile() / TorchInductor buffer | Fusion intermediate buf in pool; all compile backends same pool | 🔴 **LEAK 8/8 (cosine=1.0) — TorchInductor fusion buf in shared pool; SAFE: computation write-before-read; SAFE: reduce-overhead static buffers** |
+| 37 | SDPA / FlashAttention buffer | SDPA output in pool; V=SECRET → residue=SECRET (FlashAttention) | 🔴 **PERFECT LEAK 8/8 (Test D, err=0.0000); output pool residue ~50% hit rate; SAFE: computation write-before-read** |
 
 ## Key Insights
 
@@ -92,6 +94,10 @@ Modern ML inference servers allocate and free GPU tensors thousands of times per
 
 - **SM occupancy timing side-channel**: An attacker compute kernel can detect victim kernel presence on the same GPU via SM co-scheduling: launching 2112 CTAs (16 per SM) while victim runs identical load produces ~1.87x wall-clock slowdown in 3/5 measurement windows (60% per-window detection probability). Repeating 5 windows yields 99%+ victim-presence confidence. HBM bandwidth contention is NOT detectable — H100 HBM3 (3.35 TB/s) absorbs simultaneous 64MB sweeps by both attacker and victim without measurable latency increase.
 
+- **torch.compile() does NOT fix pool residue**: All three PyTorch compile backends (eager, aot_eager, inductor) use the same CachingAllocator pool. TorchInductor's fusion intermediate buffers (e.g., gelu(fc1(inp)) of shape [B, 4d]) are in the shared pool — `torch.empty(same_shape)` recovers them with cosine_sim=1.0000 in 8/8 passes. reduce-overhead mode (CUDA graphs) is SAFE — static buffers are overwritten on each call. Computation itself is SAFE (write-before-read).
+
+- **FlashAttention / SDPA output in shared pool**: `F.scaled_dot_product_attention` output tensor is in PyTorch's CachingAllocator pool. When V=SECRET (uniform value), attention output = SECRET (weighted average of constant V = constant), and `torch.empty(same_shape)` after `del out` recovers residue_mean=SECRET with err=0.0000 in 8/8 passes (Test D). Direct output residue is non-deterministic (~50% hit rate) due to pool competition from same-shape Q/K/V blocks. SDPA computation is SAFE — FlashAttention writes output before returning.
+
 - **CUDA MPS __shared__ NOT isolated**: Under MPS, all client processes share the same GPU context. Pool (cudaMallocAsync) is zeroed on cross-client allocation (SAFE). But hardware SM SRAM (__shared__) has no per-client isolation — attacker process reads 100% of victim process's __shared__ data at ≤100ms timing (realistic back-to-back inference requests). Both clients got identical virtual addresses (0x420000000) confirming shared context.
 
 ## Repository Structure
@@ -131,6 +137,8 @@ Modern ML inference servers allocate and free GPU tensors thousands of times per
 32_nvlink_p2p/             Exp 32:    NVLink P2P residue and cross-GPU isolation
 33_pytorch_allocator/      Exp 33:    PyTorch CachingAllocator residue
 35_llm_token_reconstruction/ Exp 35: LLM token reconstruction via activation residue
+36_torch_compile/          Exp 36: torch.compile() / TorchInductor intermediate buffer residue
+37_sdpa_flash_attn/        Exp 37: SDPA / FlashAttention output buffer residue
 ```
 
 ## Environment

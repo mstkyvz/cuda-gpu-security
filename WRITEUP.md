@@ -1848,3 +1848,125 @@ Test E — Sequential requests A→B, different sequence lengths:
 
 **Comparison with Exp 33 (PyTorch CachingAllocator baseline):**
 Exp 33 proved the mechanism (100% pool residue on same-stream reuse). Exp 35 proves the semantic impact: pool residue is not just raw bytes — it is recoverable user data (prompt tokens) that can be reversed to recover the original text input to an LLM inference server.
+
+---
+
+## Experiment 36: torch.compile() / TorchInductor Intermediate Buffer Residue
+
+**Context:** `torch.compile()` (PyTorch 2.0+) compiles Python functions into optimized CUDA kernels via TorchInductor. The generated code fuses operations (e.g., Linear + GELU + Linear into one kernel) and allocates its own intermediate buffers. Key questions: (A) does pool residue affect compiled computation? (B) are TorchInductor fusion buffers in the same CachingAllocator pool as user tensors? (C) do all compile backends share the same pool?
+
+**Setup:**
+- PyTorch 2.12.0+cu130, H100 GPU 1, MLP (Linear[d,4d] + GELU + Linear[4d,d]), d=1024, B=32
+- Backends tested: eager, aot_eager, inductor
+
+**Result (5-pass + 8-pass re-verified):**
+
+```
+Test A — Compiled output stability (pool residue affects computation?):
+  Pass 1-5: max_diff=0.00e+00 each
+  -> [OK] SAFE 5/5 — TorchInductor writes output before reading; pool residue
+     cannot corrupt compiled kernel computation. Fused kernels are write-before-read.
+
+Test B — TorchInductor fusion buffer in pool (8-pass re-verified):
+  Pass 1-8: cosine_sim=1.0000 each (best_block=0 or 1)
+  -> [!!!] LEAK 8/8 — TorchInductor's GELU(fc1(inp)) intermediate buffer [B, 4d]
+     is in the shared CachingAllocator pool. Perfect cosine similarity with
+     the reference eager-mode output confirms byte-exact recovery.
+
+Test C — torch.compile output in same pool as torch.empty:
+  Pass 1-5: mean=0.0015 std=0.5842 exact match each pass
+  -> [!!!] LEAK 5/5 — torch.compile output tensor is in the CachingAllocator pool.
+     torch.empty(same_shape) recovers it with exact mean/std match.
+
+Test D — Backend comparison:
+  eager:     pool reuse 3/3 passes [!!!]
+  aot_eager: pool reuse 3/3 passes [!!!]
+  inductor:  pool reuse 3/3 passes [!!!]
+  -> ALL three compile backends use the same CachingAllocator pool.
+     torch.compile() does not introduce any new pool isolation.
+
+Test E — reduce-overhead mode (CUDA graph static buffers):
+  Pass 1-5: zero_out_mean=0.000000 leakage_ratio=0.0000 each
+  -> [OK] SAFE 5/5 — reduce-overhead uses CUDA graphs with static output
+     binding; each kernel call OVERWRITES the static buffer with new computation.
+     Static buffers are NOT residue-vulnerable (always overwritten).
+```
+
+**Key findings:**
+
+| Test | Result | Detail |
+|------|--------|--------|
+| A | SAFE 5/5 | Compiled kernel writes output before read — pool residue can't corrupt computation |
+| B | LEAK 8/8 (cosine=1.0) | TorchInductor fusion buffer [B, 4d] in shared pool — byte-exact recovery |
+| C | LEAK 5/5 (exact match) | torch.compile output in same pool as torch.empty |
+| D | LEAK ALL backends | eager, aot_eager, inductor all use CachingAllocator — no per-backend isolation |
+| E | SAFE 5/5 | reduce-overhead static buffers overwritten on each call |
+
+**Security implication:** `torch.compile()` does not fix and does not worsen the pool residue vulnerability (Exp 33). All three backends use the same CachingAllocator, meaning the Exp 33/35 attacks apply equally to compiled and eager-mode models. TorchInductor's fusion intermediate buffers (e.g., the [B, 4d] hidden state between Linear and GELU) are also in the pool, exposing an additional intermediate tensor to residue-based recovery.
+
+**Why Test B is the strongest finding:** The fusion intermediate buffer `gelu(fc1(inp))` of shape [B, 4d] is written by TorchInductor, not by user code — it is an *internal* compiler artifact. Yet it appears in the same CachingAllocator pool. An attacker calling `[torch.empty(B, d*4) for _ in range(8)]` immediately after the compiled forward pass gets the fused activation with cosine_sim=1.0000 every time.
+
+---
+
+## Experiment 37: SDPA / FlashAttention Buffer Residue
+
+**Context:** PyTorch's `F.scaled_dot_product_attention` (SDPA) uses the FlashAttention kernel on H100 (confirmed: `flash_sdp_enabled=True`). Unlike standard cuDNN attention, FlashAttention uses a tiled SRAM-based algorithm. This experiment tests whether SDPA output and internal scratch buffers are in PyTorch's CachingAllocator pool, and whether pool residue can affect SDPA computation.
+
+**Setup:**
+- F.scaled_dot_product_attention with FlashAttention backend (H100, flash_sdp=True)
+- q, k, v shapes: [B, H, S, D] = [2, 8, 64, 64] (Tests A/B) — direct format avoids transpose intermediate allocation
+- SECRET=3.14159, 5 passes per test + 8-pass re-verification for Test D
+
+**Result (5-pass verified + targeted 8-pass re-verification):**
+
+```
+Test A — SDPA output residue (clean measurement, cosine similarity metric):
+  Pass 1-5 (cosine): 3/5 cosine_sim=1.0000 confirmed pool residue
+  8-pass extended run: 4/8 cosine_sim=1.0000
+  -> LEAK ~50% hit rate — SDPA output tensor in CachingAllocator pool.
+     Non-deterministic due to pool competition: PyTorch internal bookkeeping
+     may allocate between del and empty, consuming the block first.
+     When the block IS returned: cosine_sim=1.0000 (byte-exact).
+
+Test B — SDPA computation stable despite pool residue:
+  Pass 1-5: max_diff=0.00e+00 each
+  -> [OK] SAFE 5/5 — FlashAttention writes O before returning. Pool residue
+     in the output buffer slot does NOT affect SDPA's computation.
+
+Test C — nn.MultiheadAttention output residue:
+  Pass 1-5: match=NO each (pool competition from multiple same-shape intermediates)
+  -> [~] MHA has many intermediate tensors of same shape [S,B,E] from
+     in_proj, out_proj steps — pool competition prevents reliable recovery.
+
+Test D — V=SECRET → attention output = SECRET → residue = SECRET (8-pass re-verified):
+  Pass 1-8: expected_mean≈3.1416  residue_mean=3.1416  err=0.0000 each
+  -> [!!!] PERFECT LEAK 8/8 — When V=SECRET (uniform), attention output
+     is exactly SECRET (softmax weights sum to 1, V constant).
+     del → torch.empty → residue_mean=3.1416 with err=0.0000.
+     The SEMANTIC VALUE of the V tensor is preserved byte-exact in pool residue.
+
+Test E — Sequential: A's attention output in B's pool block:
+  Pass 1-5: near_secret=12-16/49152 (~0%) each
+  -> [~] Pool competition: Q, K, V (all [B,H,S,D]) freed simultaneously
+     with out; LIFO returns a non-output block (Q or K, not V or out).
+```
+
+**Key findings:**
+
+| Test | Result | Detail |
+|------|--------|--------|
+| A | LEAK ~50% | SDPA output in shared pool — cosine_sim=1.0000 when block returned |
+| B | SAFE 5/5 | FlashAttention writes-before-read — computation correct regardless |
+| C | Mixed | Pool competition with MHA intermediates prevents reliable recovery |
+| D | PERFECT LEAK 8/8 | V=SECRET → out=SECRET → residue=3.1416 with err=0.0000 |
+| E | 0/5 (pool race) | Multiple same-shape blocks (Q,K,V,out) compete; non-deterministic |
+
+**Why Test D is the strongest finding:** When a transformer's V (value) matrix is uniform (all equal SECRET), the FlashAttention output is exactly that value (attention is a weighted average of V; softmax weights sum to 1 × constant V = constant). The output tensor is in the CachingAllocator pool; `torch.empty(same_shape)` returns it with err=0.0000 across all 8 passes. In practice: if a previous request's V cache embeddings are all the same token (repeated padding token with known embedding value), an attacker can detect this from pool residue with 100% reliability.
+
+**Why Test A gets ~50% hit rate:** FlashAttention output [B, H, S, D] is in the pool. The miss cases are timing artifacts: between `del out` and `torch.empty`, an internal PyTorch bookkeeping allocation may consume the block. This is NOT fundamental isolation — it is non-determinism. When the block IS returned (cosine_sim=1.0000), it is byte-exact every time.
+
+**Comparison with Exp 30 (cuDNN workspace) and Exp 33 (PyTorch pool):**
+- cuDNN: workspace buffer in pool (Exp 30), cuDNN computation writes before reading
+- PyTorch CachingAllocator: output in pool, computation writes before reading (Exp 33)
+- SDPA/FlashAttention: same pattern — output in pool, computation correct
+The pattern is universal: GPU kernel computations are write-before-read, so pool residue does not corrupt computation, but the output IS observable from pool residue.
