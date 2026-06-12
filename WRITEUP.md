@@ -1687,3 +1687,78 @@ The bridge (`cudaMalloc` staging buffer) is required because `cudaMallocAsync` p
 - Tensor Parallel (TP) inference distributes model shards across GPUs and uses `ncclAllReduce` / P2P copies for activations. If an activation buffer is returned to the pool without zeroing, the next TP request's activation copy via NVLink carries the prior request's data.
 - NVLink P2P provides no confidentiality — it is a raw DRAM-to-DRAM path.
 - Cross-device pool isolation IS maintained (GPU 0 pool never leaks to GPU 1 pool allocation), but single-GPU pool residue survives P2P transfer.
+
+---
+
+## Experiment 33: PyTorch CachingAllocator Residue
+
+**Context:** PyTorch manages its own GPU memory pool on top of CUDA's allocator (`torch.cuda.CachingAllocator`). When a tensor is deleted, PyTorch does NOT immediately return memory to the CUDA driver — it caches the block internally for fast reuse. The next `torch.empty()` of the same size on the same CUDA stream receives the cached block **without zeroing**. This is the same class of vulnerability as the CUDA pool residue in Exps 1-22, but now at the PyTorch framework level — affecting every ML workload.
+
+**Setup:**
+- PyTorch 2.12.0+cu130, H100 80GB HBM3 (GPU 1), SECRET=3.14159
+- N=1,048,576 float32 elements (4MB) per test
+- 5 passes per test
+
+**Result (5-pass verified):**
+
+```
+Test A — Basic pool residue (del -> torch.empty, same stream):
+  Pass 1-5: SECRET=1048576/1048576 (100.0%) each
+  -> [!!!] LEAK 5/5 — PyTorch CachingAllocator reuses block without zeroing
+
+Test B — empty_cache() before re-alloc:
+  Pass 1-5: SECRET=0/1048576 (0.0%) each
+  -> SAFE 5/5 — torch.cuda.empty_cache() returns block to CUDA driver;
+     driver zeroes on next cudaMalloc
+
+Test C — Cross-stream (stream-A -> default stream):
+  Pass 1-5: SECRET=0/1048576 (0.0%) each
+  -> SAFE 5/5 — PyTorch allocator is stream-aware; cross-stream reuse isolated
+
+Test D — Gradient buffer residue (backward -> del grad -> re-alloc):
+  grad_mean=1.00 (correct); re-alloc SECRET=1048576/1048576 (100.0%) each pass
+  -> [!!!] LEAK 5/5 — deleted tensor's data buffer returned to pool with SECRET intact
+
+Test E — nn.Linear activation residue (forward -> del output -> re-alloc):
+  out_mean=-0.0018 (correct linear transform); re-alloc SECRET=1048576/1048576 (100.0%) each pass
+  -> [!!!] LEAK 5/5 — input activation buffer (containing SECRET) returned to pool
+```
+
+**Key findings:**
+
+| Test | Result | Detail |
+|------|--------|--------|
+| A | LEAK 5/5 (100%) | Same-stream del+empty: CachingAllocator reuses without zeroing |
+| B | SAFE 5/5 | empty_cache() causes driver-zeroed fresh cudaMalloc |
+| C | SAFE 5/5 | Cross-stream alloc uses different stream pool |
+| D | LEAK 5/5 (100%) | Gradient computation's input tensor retained in pool |
+| E | LEAK 5/5 (100%) | nn.Linear input activation buffer retained in pool |
+
+**Why Test A leaks:** PyTorch's CachingAllocator mirrors the CUDA stream-ordered allocator pattern (Exps 1-22). Deleted tensors on stream S go into S's free-list. The next `torch.empty(same_size)` on stream S pops the cached block directly — no zeroing, no CUDA runtime involvement. This is by design for performance.
+
+**Why Test B is SAFE:** `torch.cuda.empty_cache()` flushes PyTorch's internal free-lists back to the CUDA driver via `cudaFree`. The next `torch.empty()` triggers a fresh `cudaMalloc`; NVIDIA's driver zeroes new allocations. This is the correct mitigation but incurs the overhead of a round-trip through the driver allocator.
+
+**Why Test C is SAFE:** PyTorch tracks which CUDA stream each cached block was freed on. A block freed on stream-A is only eligible for reuse on stream-A (after stream-A has progressed past the free point). Default-stream allocs get default-stream blocks. This is the same cross-stream isolation as CUDA's stream-ordered allocator.
+
+**Why Tests D and E leak:** In Test D, `x` was filled with SECRET and `requires_grad=True`. After `loss.backward()`, `x.data` (containing SECRET) is still held in PyTorch's pool. Deleting `x` returns the data buffer to the pool — not the gradient buffer (which has 1.0s). The next `torch.empty(N)` receives x's data block with SECRET. In Test E, the `inp` tensor (filled with SECRET, shape 512x2048) is passed to `nn.Linear`. After `del out, inp`, the inp buffer (containing SECRET) is the last freed block and is returned first by the LIFO pool on the next `torch.empty(512, 2048)`.
+
+**Practical attack scenario — LLM inference server:**
+
+```
+Request A:  user sends "my password is 12345"
+            → tokenize → embed → inp tensor (token embeddings from SECRET prompt)
+            → model.forward(inp) → out
+            → del inp, out  (both go to PyTorch pool)
+
+Request B:  model.forward(new_inp) — PyTorch allocates new buffer
+            → gets Request A's inp buffer from pool
+            → new_inp contains Request A's token embeddings (= SECRET prompt data)
+```
+
+Token embeddings directly encode input token IDs. An attacker who can observe intermediate tensor allocations (e.g., via same-process shared memory, CUDA IPC, or MPS __shared__) can reconstruct the previous request's token sequence from the embedding residue.
+
+**Comparison with CUDA pool residue (Exps 1-22):**
+- Root cause is identical: allocator reuses blocks without zeroing
+- Scope is broader: PyTorch wraps ALL GPU tensors, so every ML operation is affected
+- Mitigation at PyTorch level: `torch.cuda.empty_cache()` before security-sensitive allocations (expensive — forces driver round-trip)
+- Cross-stream isolation works at both CUDA and PyTorch levels (SAFE in both)
