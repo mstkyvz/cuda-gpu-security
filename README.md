@@ -46,6 +46,7 @@ Modern ML inference servers allocate and free GPU tensors thousands of times per
 | 31 | SM occupancy timing | SM co-scheduling detection via compute throughput & HBM latency | 🟡 **SM slowdown DETECTABLE 3/5 passes (~1.87x); HBM bandwidth contention SAFE 5/5** |
 | 32 | NVLink P2P residue | P2P zeroing, cross-GPU pool isolation, pool residue via P2P staging | 🔴 **P2P transparent (no zeroing); cross-GPU pool SAFE; pool residue LEAKS via cudaMalloc staging 5/5** |
 | 33 | PyTorch CachingAllocator residue | del tensor -> torch.empty: pool reuse, grad buf, activation buf | 🔴 **LEAK 100% 5/5 (same-stream); empty_cache() SAFE; cross-stream SAFE; grad+activation buf LEAK 100%** |
+| 35 | LLM token reconstruction | GPT-2 embedding/logit residue → exact prompt token recovery | 🔴 **PERFECT LEAK 5/5 — full prompt reconstructed token-by-token from pool residue; logits exact match** |
 
 ## Key Insights
 
@@ -83,6 +84,8 @@ Modern ML inference servers allocate and free GPU tensors thousands of times per
 
 - **GPU L2 cache timing side-channel works**: H100 L2 (50 MB) is shared across all SMs with no per-process or per-stream partition. Attacker uses differential Prime+Probe: flush L2 → baseline probe → flush L2 → victim access → attack probe → largest latency drop = victim slot. L2 hit: ~674 cycles, HBM miss: ~840–1280 cycles (1.25×–1.90× ratio). Avg 92% secret inference across 5 passes (13–16/16 per run, random baseline 6.25%). Cross-stream L2 NOT isolated. MIG instances are immune (separate L2 per partition); standard GPU isolation is not.
 - **CUDA Graphs do NOT zero pool allocations**: `cudaMallocAsync` inside a graph capture reuses the same pool block from the warmup run. That block holds the warmup-phase activation data when the graph replays for a new request. PyTorch `torch.cuda.CUDAGraph` is directly affected. Graph destroy correctly zeroes the pool block (SAFE). `__shared__` residue from graph kernels follows the same behavior as standalone kernels (Exp 23).
+- **LLM prompt token reconstruction via pool residue (end-to-end attack)**: GPT-2 embedding tensor freed to PyTorch pool → next torch.empty(same shape) returns exact bytes → cosine nearest-neighbour in wte.weight recovers 100% of prompt tokens. Logit tensor also recoverable with exact std match and 100% argmax agreement. Test C confirms even after full forward pass the embedding block is at pool index 0 (LIFO). torch.allclose=True — byte-exact recovery confirmed. Requires same CUDA stream and knowledge of victim sequence length.
+
 - **PyTorch CachingAllocator does NOT zero on reuse**: torch.empty() on the same CUDA stream as a recently deleted tensor receives the cached block with prior data intact. 100% SECRET recovery in Tests A (basic), D (gradient buffer), E (nn.Linear activation input) — 5/5 passes each. torch.cuda.empty_cache() is the mitigation (forces driver round-trip + zeroing) but is expensive. Cross-stream allocation is isolated (SAFE). Affects every ML workload using PyTorch.
 
 - **NVLink P2P is transparent (no zeroing guarantee)**: cudaMemcpyPeer and P2P mapped load/store transfer raw DRAM bytes with no zeroing. GPU 1 can directly read GPU 0 memory via P2P pointer; GPU 1 writes to GPU 0 are immediately coherent (NVLink 4.0 hardware coherency). Cross-device pool isolation is SAFE (GPU pools are strictly per-device; GPU 1 never receives GPU 0 HBM pages). Pool residue can propagate via P2P only with explicit cudaMalloc staging — cudaMallocAsync pool pointers are NOT directly P2P-accessible.
@@ -127,6 +130,7 @@ Modern ML inference servers allocate and free GPU tensors thousands of times per
 31_sm_occupancy/           Exp 31:    SM occupancy timing side-channel
 32_nvlink_p2p/             Exp 32:    NVLink P2P residue and cross-GPU isolation
 33_pytorch_allocator/      Exp 33:    PyTorch CachingAllocator residue
+35_llm_token_reconstruction/ Exp 35: LLM token reconstruction via activation residue
 ```
 
 ## Environment
