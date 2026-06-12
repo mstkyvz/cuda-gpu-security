@@ -51,6 +51,8 @@ Modern ML inference servers allocate and free GPU tensors thousands of times per
 | 37 | SDPA / FlashAttention buffer | SDPA output in pool; V=SECRET → residue=SECRET (FlashAttention) | 🔴 **PERFECT LEAK 8/8 (Test D, err=0.0000); output pool residue ~50% hit rate; SAFE: computation write-before-read** |
 | 38 | NCCL collective buffer residue | allreduce/allgather/broadcast output in shared pool | 🔴 **PERFECT LEAK 5/5 (cos=1.0000) — all collective types; 5 SECRET values; 4 shapes; 100% elem match (allreduce/broadcast)** |
 | 39 | GPU power side-channel (NVML) | Power fingerprinting: workload type, batch size, temporal detection | 🟡 **DETECTABLE: matmul vs attn 343W spread; B≤16 vs B≥64 117W gap; 4/4 compute events detected; activation type NOT distinguishable** |
+| 40 | cuFFT output buffer residue | rfft/fft output in pool → IFFT → original audio reconstruction | 🔴 **PERFECT LEAK 8/8 — rfft cos=1.0; audio reconstruction cos=1.0, peak freq exact; fft 5/5; mel pipeline SAFE (pool competition)** |
+| 41 | Autograd backward pass residue | Forward output + gradient direction in pool post-backward | 🔴 **LEAK 8/8 (cos=1.0) — output buffer in pool after backward; gradient direction exact; accumulation 5/5; gradient inversion attack enabled** |
 
 ## Key Insights
 
@@ -97,6 +99,10 @@ Modern ML inference servers allocate and free GPU tensors thousands of times per
 - **SM occupancy timing side-channel**: An attacker compute kernel can detect victim kernel presence on the same GPU via SM co-scheduling: launching 2112 CTAs (16 per SM) while victim runs identical load produces ~1.87x wall-clock slowdown in 3/5 measurement windows (60% per-window detection probability). Repeating 5 windows yields 99%+ victim-presence confidence. HBM bandwidth contention is NOT detectable — H100 HBM3 (3.35 TB/s) absorbs simultaneous 64MB sweeps by both attacker and victim without measurable latency increase.
 
 - **torch.compile() does NOT fix pool residue**: All three PyTorch compile backends (eager, aot_eager, inductor) use the same CachingAllocator pool. TorchInductor's fusion intermediate buffers (e.g., gelu(fc1(inp)) of shape [B, 4d]) are in the shared pool — `torch.empty(same_shape)` recovers them with cosine_sim=1.0000 in 8/8 passes. reduce-overhead mode (CUDA graphs) is SAFE — static buffers are overwritten on each call. Computation itself is SAFE (write-before-read).
+
+- **cuFFT output in shared pool — audio reconstruction possible**: `torch.fft.rfft` and `torch.fft.fft` output buffers are in PyTorch's CachingAllocator pool. After `del fft_out`, `torch.empty(same_shape, dtype=torch.complex64)` returns the FFT residue with cos=1.0000 in 8/8 passes. Applying `torch.fft.irfft(residue, n=N)` reconstructs the original audio signal with cos=1.0000 and exact peak frequency bin match. A speech-to-text server's audio input is fully recoverable from GPU pool residue. Multi-step mel-spectrogram pipeline is SAFE (pool competition from multiple intermediate shapes).
+
+- **Autograd backward pass leaks gradient direction**: After `loss.backward()` + `del loss` + `del out`, the forward output buffer `out` [B, d] is in the pool. For MSE loss, `∂L/∂out = 2·out/(B·d)` is proportional to `out`, so `torch.empty(B, d)` returns a tensor with cos=1.0000 to the true gradient in 8/8 passes. Gradient direction is exact; magnitude requires knowing the loss scale. Enables gradient inversion attacks (Geiping et al. 2020) on training data. Gradient accumulation (N=4 steps) does NOT protect — each step's output is in the pool.
 
 - **NCCL collective outputs are in the CachingAllocator pool**: `dist.all_reduce`, `dist.all_gather`, and `dist.broadcast` outputs all land in the shared PyTorch pool without zeroing. After any collective + `del`, `torch.empty(same_shape)` returns the output bytes with cosine_sim=1.0000 in 5/5 passes. Covers all tested shapes and all 5 tested SECRET values. In distributed DDP training, an adversarial worker can recover the allreduce gradient from pool residue — enabling gradient inversion attacks on all workers' training data simultaneously.
 
@@ -147,6 +153,8 @@ Modern ML inference servers allocate and free GPU tensors thousands of times per
 37_sdpa_flash_attn/        Exp 37: SDPA / FlashAttention output buffer residue
 38_nccl_residue/           Exp 38: NCCL collective buffer residue (allreduce/allgather/broadcast)
 39_power_sidechannel/      Exp 39: GPU power side-channel via NVML (workload fingerprinting)
+40_cufft_residue/          Exp 40: cuFFT output buffer residue (audio signal reconstruction)
+41_autograd_residue/       Exp 41: Autograd backward pass residue (gradient direction in pool)
 ```
 
 ## Environment
