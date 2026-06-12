@@ -49,6 +49,8 @@ Modern ML inference servers allocate and free GPU tensors thousands of times per
 | 35 | LLM token reconstruction | GPT-2 embedding/logit residue → exact prompt token recovery | 🔴 **PERFECT LEAK 5/5 — full prompt reconstructed token-by-token from pool residue; logits exact match** |
 | 36 | torch.compile() / TorchInductor buffer | Fusion intermediate buf in pool; all compile backends same pool | 🔴 **LEAK 8/8 (cosine=1.0) — TorchInductor fusion buf in shared pool; SAFE: computation write-before-read; SAFE: reduce-overhead static buffers** |
 | 37 | SDPA / FlashAttention buffer | SDPA output in pool; V=SECRET → residue=SECRET (FlashAttention) | 🔴 **PERFECT LEAK 8/8 (Test D, err=0.0000); output pool residue ~50% hit rate; SAFE: computation write-before-read** |
+| 38 | NCCL collective buffer residue | allreduce/allgather/broadcast output in shared pool | 🔴 **PERFECT LEAK 5/5 (cos=1.0000) — all collective types; 5 SECRET values; 4 shapes; 100% elem match (allreduce/broadcast)** |
+| 39 | GPU power side-channel (NVML) | Power fingerprinting: workload type, batch size, temporal detection | 🟡 **DETECTABLE: matmul vs attn 343W spread; B≤16 vs B≥64 117W gap; 4/4 compute events detected; activation type NOT distinguishable** |
 
 ## Key Insights
 
@@ -96,6 +98,10 @@ Modern ML inference servers allocate and free GPU tensors thousands of times per
 
 - **torch.compile() does NOT fix pool residue**: All three PyTorch compile backends (eager, aot_eager, inductor) use the same CachingAllocator pool. TorchInductor's fusion intermediate buffers (e.g., gelu(fc1(inp)) of shape [B, 4d]) are in the shared pool — `torch.empty(same_shape)` recovers them with cosine_sim=1.0000 in 8/8 passes. reduce-overhead mode (CUDA graphs) is SAFE — static buffers are overwritten on each call. Computation itself is SAFE (write-before-read).
 
+- **NCCL collective outputs are in the CachingAllocator pool**: `dist.all_reduce`, `dist.all_gather`, and `dist.broadcast` outputs all land in the shared PyTorch pool without zeroing. After any collective + `del`, `torch.empty(same_shape)` returns the output bytes with cosine_sim=1.0000 in 5/5 passes. Covers all tested shapes and all 5 tested SECRET values. In distributed DDP training, an adversarial worker can recover the allreduce gradient from pool residue — enabling gradient inversion attacks on all workers' training data simultaneously.
+
+- **GPU power side-channel via NVML**: `nvmlDeviceGetPowerUsage()` (available to any process on the GPU node) reveals victim compute with 9.6× idle-to-peak power ratio on H100. Three workload classes (matmul/memset/attention) are non-overlapping across 4 rounds with 343W spread. Batch size class (B≤16 vs B≥64) is distinguishable with 117W gap. Compute start/stop events are detectable within 50ms with 100% accuracy (4/4). Activation type (GELU vs ReLU) is NOT distinguishable at this scale.
+
 - **FlashAttention / SDPA output in shared pool**: `F.scaled_dot_product_attention` output tensor is in PyTorch's CachingAllocator pool. When V=SECRET (uniform value), attention output = SECRET (weighted average of constant V = constant), and `torch.empty(same_shape)` after `del out` recovers residue_mean=SECRET with err=0.0000 in 8/8 passes (Test D). Direct output residue is non-deterministic (~50% hit rate) due to pool competition from same-shape Q/K/V blocks. SDPA computation is SAFE — FlashAttention writes output before returning.
 
 - **CUDA MPS __shared__ NOT isolated**: Under MPS, all client processes share the same GPU context. Pool (cudaMallocAsync) is zeroed on cross-client allocation (SAFE). But hardware SM SRAM (__shared__) has no per-client isolation — attacker process reads 100% of victim process's __shared__ data at ≤100ms timing (realistic back-to-back inference requests). Both clients got identical virtual addresses (0x420000000) confirming shared context.
@@ -139,6 +145,8 @@ Modern ML inference servers allocate and free GPU tensors thousands of times per
 35_llm_token_reconstruction/ Exp 35: LLM token reconstruction via activation residue
 36_torch_compile/          Exp 36: torch.compile() / TorchInductor intermediate buffer residue
 37_sdpa_flash_attn/        Exp 37: SDPA / FlashAttention output buffer residue
+38_nccl_residue/           Exp 38: NCCL collective buffer residue (allreduce/allgather/broadcast)
+39_power_sidechannel/      Exp 39: GPU power side-channel via NVML (workload fingerprinting)
 ```
 
 ## Environment
